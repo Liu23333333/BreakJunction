@@ -1,0 +1,2893 @@
+#pragma rtGlobals=3	// Use modern global access method and strict wave access.
+
+StrConstant Setup= "Ratner" // Name of Setup
+
+#include ":Thermo_Module"
+#include ":EChem_Module"
+#include ":More Extensions:Data Acquisition:Visa"
+
+	Strconstant ZActuatorName= "ASRL3::INSTR"
+	Strconstant XYActuatorName= "ASRL3::INSTR"
+
+	Constant K_G0= 77.480917346e-6	// Quantum conductance in micro S, from Wikipedia
+	Constant K_ZPiezoScale = 160
+
+	Strconstant HighResPiezoOut= "dev1/ao0"
+	Strconstant HighResBiasOut= "dev1/ao1"
+	Strconstant HighResVoltageIn= "dev1/ai0"
+	Strconstant HighResCurrentIn= "dev1/ai1"
+
+	Strconstant LowResCurrentIn= "dev2/ai1"
+	Strconstant LowResVoltageIn= "dev2/ai2"
+	Strconstant LowResPiezoIn= "dev2/ai3"
+	Strconstant LowResFemtoOut = "dev2/ao0"
+
+Strconstant SetupID= "Y"
+Strconstant DataDir= "B:Experiments:"
+
+Menu "Macros"
+	"STM Break Junction Measurement", InitializeExperiment()
+	"EChem Measurement", InitializeEChem()
+	"Thermo Measurement", InitializeThermo()
+End
+
+Function InitializeExperiment()
+	SetDataFolder root:
+	if (exists("G_PathDate")==0)
+		Declare_STMBJ_Variables()
+		MakePath()
+	endif
+
+	Declare_Actuator_Variables()
+
+	DoWindow/F BreakJunctionMeasurement
+	if (V_FLag==0)
+		Execute "BreakJunctionMeasurement()"
+	endif
+End
+
+Function ApproachButton(ctrlName) : ButtonControl
+	String ctrlName
+
+	StopBkgdSampling()
+	HighResCardApproach()
+	StartBkgdSampling()
+
+	Slider SliderPos_Z win=BreakJunctionMeasurement, disable=0 // sets Z piezo slider to normal operation (disable=0)
+End
+
+Function BackgroundRead(s)
+	STRUCT WMBackgroundStruct &s // linked to background task BkgdRead
+
+	Wave LowResReadWaveBkgd
+	Wave HighResReadWaveBkgd
+	Wave SenseInBkgd
+	Wave VolHighResIn, CurHighResIn
+
+	NVAR G_ID1= G_ID1
+	NVAR G_ID2= G_ID2
+	NVAR CurrentSample= G_CurrentSamplingReadoutVal
+	NVAR JunctionVoltage= G_JunctionVoltage
+	NVAR PiezoBiasSample= G_PiezoBiasSamplingReadoutVal
+	NVAR CurrentVoltConversion= G_CurrentVoltConversion
+	NVAR ReadWaveSize= G_FastReadWaveSize
+	NVAR AcquisitionRate= G_AcquisitionRate
+
+	Redimension/D/N=(ReadWaveSize) VolHighResIn, CurHighResIn // remakes the named waves, preserving contents as much as possible, D = double precision, N= number of points each wave will have
+	Redimension/D/N=(ReadWaveSize*2) HighResReadWaveBkgd
+	Redimension/D/N=(ReadWaveSize) LowResReadWaveBkgd, SenseInBkgd
+
+
+	MXStartTask(G_ID1)
+	MXReadAnalogF64(G_ID1,10,2,HighResReadWaveBkgd); // ***GUESS: Read 10 samples, into 2 arrays, each array size is HighResReadWaveBkgd***
+	MXStopTask(G_ID1)
+
+	VolHighResIn= -HighResReadWaveBkgd[p] // first half of HighResReadWaveBkgd is voltage (for [p] help see Waveform Arithmetic and Assignment)
+	CurHighResIn= -HighResReadWaveBkgd[ReadWaveSize+p] // second half of HighResReadWaveBkgd is
+
+	JunctionVoltage= Mean(VolHighResIn) * 1e3	// in mV
+	CurrentSample = Mean(CurHighResIn)*CurrentVoltConversion	// in micro Amps
+
+	if (abs(CurrentSample)>.15)
+		beep
+	endif
+
+	DoUpdate
+	return 0
+End
+
+Function BkgdSamplingCheckProc(ctrlName,checked) : CheckBoxControl // name of checkbox is OnCheck
+	String ctrlName
+	Variable checked
+
+	if(checked==1)
+		StartBkgdSampling()
+	elseif(checked==0)
+		StopBkgdSampling()
+	endif
+End
+
+Function ClearHRTaskID1()
+	NVAR G_ID1=G_ID1
+
+	MXClearTask(G_ID1)
+End
+
+Function ClearLRTaskID3()
+	NVAR G_ID3=G_ID3
+
+	MXClearTask(G_ID3)
+End
+
+Function CreateInputs()
+	Wave PiezoBiasWave
+	Wave JunctionBiasWave
+	NVAR AcquisitionRate= G_AcquisitionRate
+	NVAR ExcursionRate= G_PullOutRate	// in nm/s
+	NVAR Size= G_PseudoTotalLength_nm
+	NVAR TipBias= G_TipBias
+	NVAR NumPtsInAppliedWaves= G_NumPtsInAppliedWaves	// Number of points in both PiezoBiasWave and JunctionBiasWave
+
+	NVAR startLevel= G_startLevel					// voltage of spike
+	NVAR endLevel= G_endLevel					// voltage before and after spike
+	NVAR PulseFrontEdgePt= G_PulseFrontEdgePt	// point at endLevel volts just before spike
+	NVAR PulseBackEdgePt= G_PulseBackEdgePt	// point at startLevel volts just after spike
+
+	NVAR CurrentSaveCheck= G_CurrentSaveCheck
+	NVAR BiasSave= G_BiasSaveCheck
+
+	NVAR PushPullCheck= G_PushPullCheck
+	NVAR InitialPullLength= G_InitialPullLength
+	NVAR FinalPullLength= G_FinalPullLength
+	NVAR PushPullLength= G_PushPullLength
+	NVAR HoldLength= G_HoldLength
+	NVAR NumPushPullCycles= G_NumPushPullCycles
+
+	NVAR IVCheck= G_IVCheck
+	NVAR IVSign=G_IVSignFlag
+	NVAR IVMaxBias= G_IVMaxBias
+	NVAR IVInitPull= G_IVInitPull
+	NVAR IVFinPull= G_IVFinPull
+	NVAR IVCapLength= G_IVCapLength
+	NVAR IVRampLength= G_IVRampLength
+
+	NVAR ACHoldCheck= G_ACHoldCheck
+	NVAR ACInitPullLength= G_ACInitPullLength
+	NVAR ACFinPullLength= G_ACFinPullLength
+	NVAR ACHoldLength= G_ACHoldLength
+	NVAR ACAmp= G_ACAmp
+	NVAR ACFreq= G_ACFreq
+	NVAR ACCapLength= G_ACCapLength
+
+	NVAR HBHoldCheck= G_HBHoldCheck
+	NVAR HBInitPullLength= G_HBInitPullLength
+	NVAR HBFinPullLength= G_HBFinPullLength
+	NVAR HBHoldLength= G_HBHoldLength
+	NVAR HBBias= G_HBBias
+	NVAR HBCapLengthIN= G_HBCapLengthIN
+	NVAR HBCapLengthFIN= G_HBCapLengthFIN
+	NVAR Vzero= G_Vzero
+
+	NVAR G_CustomInputCheck
+
+	if(G_CustomInputCheck==1)
+		Execute/Q "CreateCustomInputs()"
+		return 0
+	endif
+
+	if (PushPullCheck+IVCheck+ACHoldCheck+HBHoldCheck>1)
+		Print "Ramp options not designed for simultaneous use"
+		return -1
+	endif
+
+	Variable DeltaEx=ExcursionRate/K_ZPiezoScale/AcquisitionRate
+	Variable PulseMidPt
+
+	if (PushPullCheck==1)
+		BiasSave=1
+		CurrentSaveCheck=1
+
+		Variable NumInitialPullPoints=round(InitialPullLength/ExcursionRate*AcquisitionRate)
+		Variable NumPushPullPoints=round(PushPullLength/ExcursionRate*AcquisitionRate)
+		Variable NumHoldPoints= round(HoldLength/ExcursionRate*AcquisitionRate)
+		Variable NumEndingPoints= round(FinalPullLength/ExcursionRate*AcquisitionRate)
+
+		Size=InitialPullLength+NumPushPullCycles*4*(PushPullLength+HoldLength)+FinalPullLength
+		NumPtsInAppliedWaves= NumInitialPullPoints+NumPushPullCycles*4*(NumPushPullPoints+NumHoldPoints)+NumEndingPoints
+
+
+		Redimension/N=(NumPtsInAppliedWaves) PiezoBiasWave
+
+	Variable index0= NumInitialPullPoints			// Starting index for first Push/Pull cycle
+		PiezoBiasWave[0,index0-1]=-p*DeltaEx
+
+
+        Variable k, index1, index2, index3, index4
+		for (k=0;k<NumPushPullCycles;k+=1) 
+
+			index1=	index0+NumHoldPoints 		// Index at end of first hold in cycle
+			index2=	index1+NumPushPullPoints	// Index at end of push in cycle
+			index3=	index2+NumHoldPoints 		// Index at end of second hold cycle
+			index4=	index3+NumPushPullPoints	// Index at end of push in cycle
+
+
+
+
+			PiezoBiasWave[index0,index1-1]= PiezoBiasWave[index0-1]
+			PiezoBiasWave[index1,index2-1]= PiezoBiasWave[index0-1]+(p-index1)*DeltaEx
+			PiezoBiasWave[index2,index3-1]= PiezoBiasWave[index2-1]
+			PiezoBiasWave[index3,index4-1]= PiezoBiasWave[index2-1]-(p-index3)*DeltaEx        //YZ
+
+
+			
+	
+			
+			              
+			
+			
+
+           index0= index4
+
+
+		endfor
+
+		PiezoBiasWave[index4,NumPtsInAppliedWaves-1]= PiezoBiasWave[index4-1]-(p-index4)*DeltaEx
+		
+		Redimension/N=(NumPtsInAppliedWaves) JunctionBiasWave
+		JunctionBiasWave = -(TipBias/1000)
+
+	elseif (IVCheck==1)
+		BiasSave=1
+		CurrentSaveCheck=1
+
+
+		Variable numCycle=1
+
+		Variable NumIVInitialPullPoints= round(IVInitPull/ExcursionRate*AcquisitionRate)
+		Variable NumIVCapPoints= round(IVCapLength/ExcursionRate*AcquisitionRate)
+		Variable NumIVRampPoints= round(IVRampLength/ExcursionRate*AcquisitionRate)
+		Variable NumIVFinalPullPoints= round(IVFinPull/ExcursionRate*AcquisitionRate)
+
+		Size= IVInitPull+IVCapLength+numCycle*IVRampLength+IVCapLength+IVFinPull
+		NumPtsInAppliedWaves= NumIVInitialPullPoints+NumIVCapPoints+numCycle*NumIVRampPoints+NumIVCapPoints+NumIVFinalPullPoints
+		Redimension/N=(NumPtsInAppliedWaves) PiezoBiasWave
+
+		Variable IVindex1= NumIVInitialPullPoints
+		Variable IVindex2= IVindex1+NumIVCapPoints
+		Variable IVindex3= IVindex2+NumIVRampPoints
+		Variable IVindex4= IVindex3+(numCycle-1)*NumIVRampPoints+NumIVCapPoints
+		Variable IVindex5= IVindex4+NumIVFinalPullPoints
+
+		PiezoBiasWave[0,IVindex1-1]= -p*DeltaEx
+		PiezoBiasWave[IVindex1,IVindex4-1]= PiezoBiasWave[IVindex1-1]
+		PiezoBiasWave[IVindex4,IVindex5-1]= -(p-2*NumIVCapPoints+-NumIVRampPoints)*DeltaEx
+
+		Variable BiasIndex1= IVindex2
+		Variable BiasIndex2= IVindex2+(NumIVRampPoints/4)
+		Variable BiasIndex3= IVindex3-(NumIVRampPoints/4)
+		Variable BiasIndex4= IVindex3
+		Variable BiasIndex5=IVindex3+(numCycle-1)*NumIVRampPoints
+
+		Redimension/N=(NumPtsInAppliedWaves) JunctionBiasWave
+		JunctionBiasWave= (TipBias/1000)
+		Variable DelBias= 4*IVMaxBias/NumIVRampPoints
+		JunctionBiasWave[BiasIndex1,BiasIndex2-1]= (p-NumIVInitialPullPoints-NumIVCapPoints)*DelBias
+		JunctionBiasWave[BiasIndex2,BiasIndex3-1]= IVMaxBias-(p-NumIVInitialPullPoints-NumIVCapPoints-NumIVRampPoints/4)*DelBias
+		JunctionBiasWave[BiasIndex3,BiasIndex4-1]= -IVMaxBias+(p-NumIVInitialPullPoints-NumIVCapPoints-3*NumIVRampPoints/4)*DelBias
+		JunctionBiasWAVE[BiasIndex4,BiasIndex5-1]=JunctionBiasWave[p-numIVrampPoints]
+
+		JunctionBiasWave*= -1 // To have normal convention???
+
+		if (IVSign==1)	// If IVSign==1, the ramp goes 'negative' first
+			JunctionBiasWave[BiasIndex1,BiasIndex5-1]*= -1
+		endif
+
+	PulseFrontEdgePt= NumPtsInAppliedWaves-round(7.5e-3*AcquisitionRate)-1
+
+	PulseBackEdgePt= NumPtsInAppliedWaves-round(2.5e-3*AcquisitionRate)+1
+
+	PulseMidPt= NumPtsInAppliedWaves-round(5e-3*AcquisitionRate)
+
+	endLevel= JunctionBiasWave[NumPtsInAppliedWaves-PulseMidPt]
+	startLevel= -sign(JunctionBiasWave[NumPtsInAppliedWaves-PulseMidPt])
+
+	JunctionBiasWave[PulseFrontEdgePt+1,PulseBackEdgePt-1]= (TipBias/1000)
+
+
+
+	elseif (ACHoldCheck==1)
+		BiasSave=1
+		CurrentSaveCheck=1
+
+		Variable NumACInitialPullPoints= round(ACInitPullLength/ExcursionRate*AcquisitionRate)
+		Variable NumACCapPoints= round(ACCapLength/ExcursionRate*AcquisitionRate)
+		Variable NumACHoldPoints= round(ACHoldLength/ExcursionRate*AcquisitionRate)
+		Variable NumACFinalPullPoints= round(ACFinPullLength/ExcursionRate*AcquisitionRate)
+
+		Size= ACInitPullLength+2*ACCapLength+ACHoldLength+ACFinPullLength	// nm
+		NumPtsInAppliedWaves= NumACInitialPullPoints+2*NumACCapPoints+NumACHoldPoints+NumACFinalPullPoints
+		Redimension/N=(NumPtsInAppliedWaves) PiezoBiasWave
+
+		Variable ACindex1= NumACInitialPullPoints
+		Variable ACindex2= ACindex1+NumACCapPoints
+		Variable ACindex3= ACindex2+NumACHoldPoints
+		Variable ACindex4= ACindex3+NumACCapPoints
+		Variable ACindex5= ACindex4+NumACFinalPullPoints
+
+		PiezoBiasWave[0,ACindex1-1]= -p*DeltaEx
+		PiezoBiasWave[ACindex1,ACindex4-1]= PiezoBiasWave[ACindex1-1]
+		PiezoBiasWave[ACindex4,ACindex5-1]= -(p-2*NumACCapPoints-NumACHoldPoints)*DeltaEx
+
+		Redimension/N=(NumPtsInAppliedWaves) JunctionBiasWave
+		JunctionBiasWave= -(TipBias)/1000
+		JunctionBiasWave[ACindex2,ACindex3-1]=ACAmp*sin(2*pi*ACFreq*1000*(p-ACindex2)/AcquisitionRate)
+
+	elseif (HBHoldCheck==1)
+		BiasSave=1
+		CurrentSaveCheck=1
+
+		Variable NumHBInitialPullPoints= round(HBInitPullLength/ExcursionRate*AcquisitionRate)
+		Variable NumHBCapPointsIN= round(HBCapLengthIN/ExcursionRate*AcquisitionRate)
+		Variable NumHBCapPointsFIN= round(HBCapLengthFIN/ExcursionRate*AcquisitionRate)
+		Variable NumHBHoldPoints= round(HBHoldLength/ExcursionRate*AcquisitionRate)
+		Variable NumHBFinalPullPoints= round(HBFinPullLength/ExcursionRate*AcquisitionRate)
+
+		Size= HBInitPullLength+ (HBCapLengthIN + HBCapLengthFIN) +HBHoldLength+HBFinPullLength	// nm
+		NumPtsInAppliedWaves= NumHBInitialPullPoints+ (NumHBCapPointsIN + NumHBCapPointsFIN) +NumHBHoldPoints+NumHBFinalPullPoints
+		Redimension/N=(NumPtsInAppliedWaves) PiezoBiasWave
+
+		Variable HBindex1= NumHBInitialPullPoints
+		Variable HBindex2= HBindex1+NumHBCapPointsIN
+		Variable HBindex3= HBindex2+NumHBHoldPoints
+		Variable HBindex4= HBindex3+NumHBCapPointsFIN
+		Variable HBindex5= HBindex4+NumHBFinalPullPoints
+
+		Variable HB_C=0
+		Variable HBindex4_1= HBindex4+NumHBFinalPullPoints-5000
+		Variable HBindex4_2= HBindex4+NumHBFinalPullPoints-4000
+
+		PiezoBiasWave[0,HBindex1-1]= -p*DeltaEx
+		PiezoBiasWave[HBindex1,HBindex4-1]= PiezoBiasWave[HBindex1-1]
+		PiezoBiasWave[HBindex4,HBindex5-1]= -(p - (NumHBCapPointsIN + NumHBCapPointsFIN) -NumHBHoldPoints)*DeltaEx
+		if(HB_C==1)
+		PiezoBiasWave[HBindex4_1,HBindex4_2-1]= PiezoBiasWave[HBindex4_1-1]
+		PiezoBiasWave[HBindex4_2, HBindex5-1]= -(p - (NumHBCapPointsIN + NumHBCapPointsFIN) -NumHBHoldPoints-1000)*DeltaEx
+		endif
+
+		Redimension/N=(NumPtsInAppliedWaves) JunctionBiasWave
+		JunctionBiasWave= -(TipBias)/1000					// TipBias is in millivolts!
+		JunctionBiasWave[HBindex2,HBindex3-1]=-HBBias
+		if(HB_C==1)
+		JunctionBiasWave[HBindex4_1,HBindex4_2-1]=-HBBias
+		endif
+
+		ControlInfo/W=Thermocouples_Readout VzeroCheckBox
+		if(V_Value==1)
+			HBBias= Vzero/1000 // in V, to be displayed in HBHold Tab.
+			JunctionBiasWave[HBindex2,HBindex3-1]=-HBBias
+		endif
+
+	else  // make applied bias constant at TipBias millivolts
+
+		NumPtsInAppliedWaves = round(Size/ExcursionRate*AcquisitionRate)
+		Redimension/N=(NumPtsInAppliedWaves) PiezoBiasWave
+		PiezoBiasWave[0,NumPtsInAppliedWaves-1]=-p*DeltaEx // pull out at constant rate
+
+		Redimension/N=(NumPtsInAppliedWaves) JunctionBiasWave
+		ControlInfo/W=Thermocouples_Readout VzeroCheckBox
+		if(V_Value==1)
+			JunctionBiasWave = -(TipBias + Vzero)/1000
+		else
+			JunctionBiasWave = -(TipBias/1000)
+		endif
+
+	endif
+// Front edge is 7.5 msec before end of trace. This is point just before spike.
+	PulseFrontEdgePt= NumPtsInAppliedWaves-round(7.5e-3*AcquisitionRate)-1
+
+	PulseBackEdgePt= NumPtsInAppliedWaves-round(2.5e-3*AcquisitionRate)+1
+
+	PulseMidPt= NumPtsInAppliedWaves-round(5e-3*AcquisitionRate)
+
+	endLevel= JunctionBiasWave[NumPtsInAppliedWaves-PulseMidPt]
+	startLevel= -sign(JunctionBiasWave[NumPtsInAppliedWaves-PulseMidPt])
+
+	JunctionBiasWave[PulseFrontEdgePt+1,PulseBackEdgePt-1]= (TipBias/1000)
+
+End
+
+
+Function SetUpFemto()
+	NVAR G_AO1
+	NVAR G_DO1
+
+	MXCreateTask("G_DO1")
+	MXCreateDOChan(G_DO1,"dev2/port1/line1")
+	MXCreateDOChan(G_DO1,"dev2/port1/line2")
+	MXCreateDOChan(G_DO1,"dev2/port1/line3")
+	MXCreateDOChan(G_DO1,"dev2/port1/line4")
+	MXCreateDOChan(G_DO1,"dev2/port1/line5")
+	MXCreateDOChan(G_DO1,"dev2/port1/line6")
+	MXStartTask(G_DO1)
+	NVAR G_CurrentVoltGain
+	SetGain("",G_CurrentVoltGain,"","")
+
+	MXCreateTask("G_AO1")
+	MXCreateAOVoltageChan(G_AO1,LowResFemtoOut,-10,10)
+	MXCfgSampClkTiming(G_AO1,1000,1,1)
+	MXStartTask(G_AO1)
+
+	NVAR SuppressVolt=G_SuppressVolt
+	if(SuppressVolt==0)
+		CheckBox SuppressCheckBox win=BreakJunctionMeasurement, value=0
+	else
+		CheckBox SuppressCheckBox win=BreakJunctionMeasurement, value=1
+	endif
+
+	SetFemtoSuppress(SuppressVolt)
+End
+
+Function SetGain(ctrlName,varNum,varStr,varName) : SetVariableControl
+	String ctrlName
+	Variable varNum
+	String varStr
+	String varName
+
+	NVAR G_DO1
+	NVAR CurrentVoltConversion= G_CurrentVoltConversion
+	NVAR CurrentVoltGain= G_CurrentVoltGain
+	NVAR SuppressVolt= G_SuppressVolt
+	NVAR CounterElectrodeBias= G_CounterElectrodeBias
+
+	CurrentVoltGain = varNum
+	CurrentVoltConversion = 10^(6-CurrentVoltGain)
+
+	Make/N=6/B/U/FREE DO_Gain=0
+
+	switch(CurrentVoltGain) // numeric switch
+		case 3:
+			DO_Gain={0,0,0,1,1,0}
+			break
+		case 4:
+			DO_Gain={1,0,0,1,1,0}
+			break
+		case 5:
+			DO_Gain={0,1,0,1,1,0}
+			break
+		case 6:
+			DO_Gain={1,1,0,1,1,0}
+			break
+		case 7:
+			DO_Gain={0,0,1,1,1,0}
+			break
+		case 8:
+			DO_Gain={1,0,1,1,1,0}
+			break
+	endswitch
+
+	MXWriteDigitalLines(G_DO1,10,6,DO_Gain)
+	Print "Gain Set To ",CurrentVoltGain
+end
+
+Function FindSuppress(ctrlName) : ButtonControl
+	String ctrlName
+
+	NVAR TipBias= G_TipBias
+
+	StopBkgdSampling()
+	TestVirtualGround()
+	StartBkgdSampling()
+	CheckBox SuppressCheckBox win=BreakJunctionMeasurement, value=1 // turns check box on after clicking Find Suppress button
+End
+
+Function TestVirtualGround()
+
+	Wave HighResReadWave, CurHighResIn, VolHighResIn
+
+	NVAR G_ID1
+	NVAR TipBias = G_TipBias
+	NVAR AcquisitionRate = G_AcquisitionRate
+	NVAR CurrentVoltConversion = G_CurrentVoltConversion
+	NVAR CurrentSuppress = G_CurrentSuppress // in picoAmps
+	NVAR SuppressVolt = G_SuppressVolt
+
+	Variable HighResReadWaveSize
+	Variable ReadWaveSize = 1000
+
+	HighResReadWaveSize = ReadWaveSize * 2
+	Redimension/D/N=(HighResReadWaveSize) HighResReadWave
+	Redimension/D/N=(ReadWaveSize) CurHighResIn, VolHighResIn
+
+	SetUpHRTaskID1()
+	SetFemtoSuppress(0) // sets previous Current Suppress value to zero
+
+	MXCfgSampClkTiming(G_ID1,AcquisitionRate,1,HighResReadWaveSize)
+	sleep/s 5
+	MXStartTask(G_ID1)
+	MXReadAnalogF64(G_ID1,10,2,HighResReadWave)
+	MXStopTask(G_ID1)
+
+	VolHighResIn= HighResReadWave[p]
+	CurHighResIn= HighResReadWave[p + ReadWaveSize]
+
+	ClearHRTaskID1()
+
+	SuppressVolt= Mean(CurHighResIn)
+	CurrentSuppress=SuppressVolt*CurrentVoltConversion*1e6
+	SetFemtoSuppress(SuppressVolt)
+	Print "New current suppress is " + num2str(CurrentSuppress) + "pA"
+End
+
+Function SetCurrentSuppress(ctrlName,varNum,varStr,varName) : SetVariableControl
+	String ctrlName
+	Variable varNum	// in picoAmps
+	String varStr
+	String varName
+
+	NVAR CurrentSuppress = G_CurrentSuppress // in picoAmps
+	NVAR SuppressVolt = G_SuppressVolt
+	NVAR CurrentVoltGain = G_CurrentVoltGain
+	NVAR CurrentVoltConversion= G_CurrentVoltConversion
+	CurrentSuppress = varNum // convert to picoAmps
+	SuppressVolt = CurrentSuppress/CurrentVoltConversion*1e-6 // convert to Volts
+	SetFemtoSuppress(suppressVolt)
+	CheckBox SuppressCheckBox win=BreakJunctionMeasurement, value=1
+End
+
+Function CurrentSuppressCheckProc(ctrlName,checked) : CheckBoxControl
+	String ctrlName
+	Variable checked
+
+	NVAR SuppressVolt = G_SuppressVolt
+
+	if(checked)
+		SetFemtoSuppress(SuppressVolt)
+	else
+		SetFemtoSuppress(0)
+	endif
+End
+
+Function SetFemtoSuppress(suppressVolt)
+	Variable suppressVolt
+
+	NVAR G_AO1
+	Make/N=1/D/FREE outWAVE=suppressVolt*100 	// not sure why, but this is the correct scaling, FREE waves are waves that are not part of any data folder hierachy, useful for temp storage within functions
+	MXWriteAnalogF64(G_AO1,10,1,outWAVE)
+End
+
+
+Function Declare_Actuator_Variables()
+
+	NewDataFolder/O root:Config
+	NewDataFolder/O root:Config:VISA
+
+	Variable/G root:Config:VISA:G_ZInstr
+	Variable/G root:Config:VISA:G_ZSession
+	Variable/G root:Config:VISA:G_XYInstr
+	Variable/G root:Config:VISA:G_XYSession
+
+	String/G root:Config:VISA:G_ZActuatorListenStatus= "OFF"
+	String/G root:Config:VISA:G_XYActuatorListenStatus= "OFF"
+
+	String/G root:Config:VISA:G_Remote= "mr\r"
+	String/G root:Config:VISA:G_Local= "ml\r"
+	String/G root:Config:VISA:G_SetAmplitudeApart
+	String/G root:Config:VISA:G_SetAmplitudeCloser
+	String/G root:Config:VISA:G_OneStepApart
+	String/G root:Config:VISA:G_OneStepCloser
+	Variable/G root:Config:VISA:G_ActuatorStepAmplitudeApart= 25 // 28 is a little bit smaller than closer=30, 29 is a little bit larger
+	Variable/G root:Config:VISA:G_ActuatorStepAmplitudeCloser= 25
+End
+
+Function Declare_STMBJ_Variables()
+	Variable/G G_AcquisitionRate= 40000
+	Variable/G G_CardTimeout= 10
+	Variable/G G_WriteBufferSize= 1000
+	Variable/G G_FastReadWaveSize= 200
+
+	Variable/G G_OD1
+	Variable/G G_ID1
+	Variable/G G_ID2
+	Variable/G G_ID3
+	Variable/G G_ID4
+	Variable/G G_ID6
+	Variable/G G_AO1	// Analogue Output 1
+	Variable/G G_DO1	// Digital Output 1
+
+	Variable/G G_BiasSaveCheck=1
+	Variable/G G_HistSaveCheck=1
+	Variable/G G_CurrentSaveCheck=1
+	Variable/G G_SenseSaveCheck=0
+	Variable/G G_PiezoWaveSaveCheck=0
+
+      	Variable/G G_PiezoChanHigh=10
+      	Variable/G G_PiezoChanLow=0  // PI840.10 works under 0~+120V, 030419.  // Variable/G G_PiezoChanLow=-10
+
+	String/G G_PathDate	// encodes date and setup ID into path and folder where data is saved
+	Variable/G G_PiezoOffset_nm=0	// in nm and MUST BE LARGER THAN EXCURSION SIZE when used with unipolar piezos, zero with bipolar piezo!!!!
+	Variable/G G_PiezoDeltaZ_nm=5	//nm
+	Variable/G G_CurrentSamplingReadoutVal = 0
+	Variable/G G_PiezoBiasSamplingReadoutVal = 0
+	Variable/	G G_JunctionVoltage= 0
+	Variable/G G_NumPtsInAppliedWaves	// Number of points in both PiezoBiasWave and JunctionBiasWave
+	Variable/G G_HighResOutputRange= 2.5
+
+	Variable/G G_PseudoTotalLength_nm = 5	// nm
+	Variable/G G_ConductanceThreshold = 5 // microS
+	Variable/G G_MakeContactApproachStepSize = .5 //nm Yaping Changed it from .5 to .2, 12/28/19
+	Variable/G G_PullOutAttempt=0
+	Variable/G G_SingleAttemptFlag=0
+	Variable/G G_PullOutRate=20 // nm/s
+	Variable/G G_PullOutNumber=1
+	Variable/G G_StopNumber=1001
+	Variable/G G_EndOfTraceNoiseThreshold=0.0005
+	Variable/G G_SeriesResistance=97000
+	Variable/G G_SmashFrequency=25
+	Variable/G G_SmashInSteps=30
+	Variable/G G_SmashOutSteps=-40
+	Variable/G G_PullOutDatetime	// Igor DateTime of moment before fundamental MX data generation tasks are called in GenerateTrace
+
+	Variable/G G_CurrentVoltGain = 5
+	Variable/G G_CurrentVoltConversion = 1		// microAmps per Volt
+	Variable/G G_TipBias = 100 // Bias in mV
+	Variable/G G_CurrentSuppress = 0
+	Variable/G G_SuppressVolt = 0
+
+	Variable/G G_ActuatorStepSize = 3
+	Variable/G G_ActuatorCounter = 0
+
+	Variable/G G_SubTabNum = 0
+
+       Variable/G G_VoltageRead = 0
+       Variable/G G_ReadChan
+
+	Variable/G G_InitialPullLength
+	Variable/G G_FinalPullLength
+	Variable/G G_PushPullLength
+	Variable/G G_HoldLength
+	Variable/G G_PushPullCheck = 0
+	Variable/G G_NumPushPullCycles
+
+	Variable/G G_IVCheck = 0
+	Variable/G G_IVMaxBias = 1
+	Variable/G G_IVInitPull = 3
+	Variable/G G_IVFinPull = 4
+	Variable/G G_IVCapLength = 0.5
+	Variable/G G_IVRampLength = 2
+	Variable/G G_IVSignFlag = 0
+
+	Variable/G G_ACHoldCheck = 0
+	Variable/G G_ACInitPullLength = 3
+	Variable/G G_ACFinPullLength = 4
+	Variable/G G_ACHoldLength = 3
+	Variable/G G_ACAmp = 0.8
+	Variable/G G_ACFreq = 10		// kHz
+	Variable/G G_ACCapLength = 0.5
+
+	Variable/G G_HBHoldCheck = 0
+	Variable/G G_HBInitPullLength = 3
+	Variable/G G_HBFinPullLength = 4
+	Variable/G G_HBHoldLength = 3
+	Variable/G G_HBBias = 0.8
+	Variable/G G_HBCapLengthIN = 0.1
+	Variable/G G_HBCapLengthFIN = 0.1
+
+	Variable/G G_startLevel			// voltage of spike
+	Variable/G G_endLevel			// voltage before and after spike
+	Variable/G G_PulseFrontEdgePt	// point at endLevel volts just before spike
+	Variable/G G_PulseBackEdgePt	// point at startLevel volts just after spike
+
+	Variable/G G_CustomInputCheck=0
+
+	Make/N=0/D/O PiezoBiasWave, JunctionBiasWave // defined in CreateInputs
+
+	Make/N=0/O/D ContactCheckWave
+
+	Make/N=0/O/D HighResWriteWave
+
+	Make/N=0/O/D HighResReadWave
+	Make/N=0/O/D HighResReadWaveBkgd
+
+	Make/N=0/O/D CurrentIn, VoltageIn
+
+	Make/N=0/O/D CurHighResIn
+	Make/N=0/O/D VolHighResIn
+
+	Make/N=0/O/D VoltageLowRes
+	Make/N=0/O/D CurrentLowRes
+
+	Make/N=0/O/D PullOutVoltage, PullOutCurrent, PullOutConductance, POExtension
+
+	Make/O/N=5 HistLowG
+
+	Make/O/N=(0.01*G_AcquisitionRate) EndConductance
+
+	Make/O/N=20 ParameterWave
+
+	Make/O/N=0 PullOutConductanceSave
+
+	Make/N=0/O/D LowResReadWave, LowResReadWaveBkgd
+
+	Make/N=0/O/D SenseIn, CurrentInLowRes, SenseInBkgd
+
+	Make/N=100/O CurrentIn_Hist=0
+
+	Make/O/N=21 CurSup, CurOffset
+
+	Make/O/N=0 LogHistWave
+
+	Variable/G G_VoltageInterval= 5
+	Variable/G G_NumPoints= 5
+	Variable/G G_Vzero= 0
+	Variable/G G_Izero= 0
+	Variable/G G_Cur, G_Vol, G_Cond
+	Variable/G G_VzeroFrequency= 50
+	Variable/G G_J= 0
+	Variable/G G_OldPullOutNumber= 0
+
+	Make/O/N=0 CurrentWave, VoltageWave, ConductanceWave
+	Make/O/N=0 TipBiasRamp
+	Wave OffsetWave, PullOutNumberWave, IzeroWave
+	If(WaveExists(OffsetWave) == 0 && WaveExists(PullOutNumberWave) == 0 && WaveExists(IzeroWave) == 0)
+		Make/O/N=0 OffsetWave, IzeroWave, PullOutNumberWave
+	EndIf
+End
+
+Function GenerateTrace()
+	Wave HighResWriteWave, HighResReadWave, LowResReadWave
+	Wave CurrentIn, VoltageIn, SenseIn,TCReadTipVoltageIn, TCReadSubVoltageIn
+	Wave PullOutVoltage,PullOutCurrent,PullOutConductance,POExtension
+	Wave PiezoBiasWave, JunctionBiasWave  // already set up in CreateInputs
+	Wave HighTConversionConstant, LowTConversionConstant
+	Wave VoltageLowRes, CurrentLowRes
+
+	NVAR NumPtsInAppliedWaves=G_NumPtsInAppliedWaves
+	NVAR G_OD1=G_OD1
+	NVAR G_ID1=G_ID1
+	NVAR G_ID3=G_ID3
+	NVAR AcquisitionRate=G_AcquisitionRate
+	NVAR WriteBufferSize = G_WriteBufferSize
+	NVAR DCOffset_nm=G_PiezoOffset_nm	// in nm
+	NVAR CurrentVoltGain = G_CurrentVoltGain
+	NVAR Size = G_PseudoTotalLength_nm
+	NVAR CardTimeout = G_CardTimeout
+	NVAR TipBias = G_TipBias
+	NVAR startLevel=G_startLevel					// voltage of spike
+	NVAR endLevel=G_endLevel					// voltage before and after spike
+	NVAR PulseFrontEdgePt=G_PulseFrontEdgePt	// point at startLevel volts just after spike
+	NVAR PullOutTime= G_PullOutDatetime
+	NVAR PullOutNumber=G_PullOutNumber
+
+	NVAR TipTCAvg=G_TipTCAvg
+	NVAR SubTCAvg=G_SubTCAvg
+	NVAR RT= G_RT
+
+	NVAR SeriesResistance= G_SeriesResistance
+
+	Variable DelayOffset, HighResFrontPulsePt, error
+	Variable k=0
+	Variable NumPtsIn= NumPtsInAppliedWaves+3000
+	Variable NumSeg=NumPtsInAppliedWaves/WriteBufferSize
+	Variable PiezoOrigin=DCOffset_nm/K_ZPiezoScale
+
+	Redimension/D/N=(WriteBufferSize*2) HighResWriteWave
+	Redimension/D/N=(NumPtsIn*2) HighResReadWave
+	Redimension/D/N=(NumPtsIn) CurrentIn, VoltageIn, SenseIn//,TCReadTipVoltageIn, TCReadSubVoltageIn
+	Redimension/D/N=(NumPtsIn) VoltageLowRes, CurrentLowRes
+	Redimension/D/N=(NumPtsInAppliedWaves) PullOutVoltage,PullOutCurrent,PullOutConductance, POExtension
+
+	SetScale/I x 0,Size, PullOutVoltage,PullOutCurrent,PullOutConductance, POExtension
+
+	PullOutTime= DateTime
+
+	MXCfgSampClkTiming(G_ID1,AcquisitionRate,1,NumPtsIn)
+	MXCfgSampClkTiming(G_ID3,AcquisitionRate,1,NumPtsIn)
+	MXStartTask(G_ID1)
+	MXStartTask(G_ID3)
+
+	for (k=0;k<NumSeg;k+=1)
+		HighResWriteWave[0,WriteBufferSize-1]=PiezoBiasWave[k*WriteBufferSize+p]+PiezoOrigin
+		HighResWriteWave[WriteBufferSize,WriteBufferSize*2-1]=JunctionBiasWave[(k-1)*WriteBufferSize+p]
+		MXWriteAnalogF64(G_OD1,CardTimeout,2,HighResWriteWave)
+	endfor
+
+	DCOffset_nm+= PiezoBiasWave[NumPtsInAppliedWaves-1]*K_ZPiezoScale
+
+	HighResWriteWave[0,WriteBufferSize-1]=DCOffset_nm/K_ZPiezoScale
+	HighResWriteWave[WriteBufferSize,WriteBufferSize*2-1]=-(TipBias/1000)
+	MXWriteAnalogF64(G_OD1,CardTimeout,2,HighResWriteWave)
+
+	ControlInfo/W=Thermocouples_readout ThermoCheck
+	if(V_Value)
+		Redimension/D/N=(NumPtsIn*5) LowResReadWave
+		MXReadAnalogF64(G_ID3,10,5,LowResReadWave);
+	else
+		Redimension/D/N=(NumPtsIn*3) LowResReadWave
+		MXReadAnalogF64(G_ID3,10,3,LowResReadWave);
+	endif
+
+	MXReadAnalogF64(G_ID1,10,2,HighResReadWave);
+
+	MXStopTask(G_ID1)
+	MXStopTask(G_ID3)
+
+	VoltageIn=-HighResReadWave[p]		// Voltage (high-res)
+	CurrentIn=-HighResReadWave[NumPtsIn+p]	// Current (high-res)
+
+	CurrentLowRes= LowResReadWave[p]
+	VoltageLowRes= LowResReadWave[p+NumPtsIn]
+	Smooth/B 11, CurrentLowRes
+
+	ControlInfo/W=Thermocouples_readout ThermoCheck
+	if(V_Value)
+		TCReadTipVoltageIn=LowResReadWave[p+3*NumPtsIn]	// Temperature (low-res)
+		TCReadSubVoltageIn=LowResReadWave[p+4*NumPtsIn]
+
+		TipTCAvg = Mean(TCReadTipVoltageIn)*1e3	// in mV
+		if (TipTCAvg>0)
+			TipTCAvg= Poly(HighTConversionConstant,TipTCAvg)
+		else
+			TipTCAvg= Poly(LowTConversionConstant,TipTCAvg)
+		endif
+
+		SubTCAvg = Mean(TCReadSubVoltageIn)*1e3	// in mV
+		if (SubTCAvg>0)
+			SubTCAvg= Poly(HighTConversionConstant,SubTCAvg)
+		else
+			SubTCAvg= Poly(LowTConversionConstant,SubTCAvg)
+		endif
+
+		TipTCAvg+= RT
+		SubTCAvg+= RT
+
+		if(mod(PullOutNumber,2)==1)
+			Print "-----------------"
+			Print "Tip temp = ", TipTCAvg
+			Print "Sub Temp = ", SubTCAvg
+			Print "-----------------"
+		endif
+	endif
+
+	DelayOffset= 0
+	Make/O destWave
+		FindLevels/Q/P/D=destWave/R=[NumPtsIn-1,NumPtsIn-6000]/EDGE=0/N=2 VoltageIn, 0
+		if (V_flag!=0)
+			print "GenerateTrace: Did not find both sides of pulse for alignment"
+			return -1
+		endif
+		HighResFrontPulsePt=round(destWave[1])
+		DelayOffset=HighResFrontPulsePt-PulseFrontEdgePt
+
+
+
+
+		PullOutCurrent[0,NumPtsInAppliedWaves-1]=CurrentIn[p+DelayOffset]*(10^(-CurrentVoltGain))
+		PullOutVoltage=VoltageIn[p+DelayOffset]
+		PullOutConductance=PullOutCurrent/PullOutVoltage/(K_G0)
+
+
+	Slider SliderPos_Z win=BreakJunctionMeasurement, value=DCOffset_nm/K_ZPiezoScale
+
+	DoWindow/F PullOutGvsE
+	if (V_Flag==0)
+		execute "PullOutGvsE()"
+	endif
+
+	DoWindow/F AuAuConductanceLevel
+	if (V_Flag==0)
+		execute "AuAuConductanceLevel()"
+	endif
+
+	DoWindow/F PullOutLow
+	if (V_Flag==0)
+		execute "PullOutLow()"
+	endif
+
+	DoWindow/F HighRes
+	if(V_flag==0)
+		execute "HighRes()"
+	endif
+
+
+	DoUpdate
+
+	return 1
+
+End
+
+Function GetLowHighOffset(CurrentIn, CurrentInLowRes)
+	Wave CurrentIn, CurrentInLowRes
+	Variable  BestDelta, BestDiff, i
+	Variable index
+
+	Duplicate/O/FREE CurrentIn TestWave
+	Variable NumPts=NumPnts(TestWave), Diff
+
+	BestDelta=1000
+	BestDiff=5000
+	For (i=-1000;i<1000;i+=100)
+		TestWave=(CurrentInLowRes-CurrentIn[max(min(p-i,NumPts-1),0)])^2
+		Diff= Sum(TestWave)
+
+		if (Diff < BestDiff)
+			BestDiff=Diff
+			BestDelta=i
+		endif
+	endfor
+
+	For (i=BestDelta-100;i<BestDelta+100;i+=10)
+		TestWave=(CurrentInLowRes-CurrentIn[max(min(p-i,NumPts-1),0)])^2
+		Diff= Sum(TestWave)
+
+		if (Diff < BestDiff)
+			BestDiff=Diff
+			BestDelta=i
+		endif
+	endfor
+
+	For (i=BestDelta-10;i<BestDelta+10;i+=1)
+		TestWave=(CurrentInLowRes-CurrentIn[max(min(p-i,NumPts-1),0)])^2
+		Diff= Sum(TestWave)
+
+		if (Diff < BestDiff)
+			BestDiff=Diff
+			BestDelta=i
+		endif
+	endfor
+
+
+	return BestDelta
+
+end
+
+Function HighResCardApproach()
+	Wave HighResReadWave
+	Wave VolHighResIn, CurHighResIn // same as in BackgroundSampling()
+
+	NVAR G_ID1 = G_ID1
+	NVAR CardTimeout = G_CardTimeout
+	NVAR AcquisitionRate = G_AcquisitionRate
+	NVAR ReadWaveSize = G_FastReadWaveSize
+
+	NVAR Actual_Current = G_CurrentSamplingReadoutVal
+	NVAR CurrentVoltConversion = G_CurrentVoltConversion
+
+	NVAR TipBias = G_TipBias
+	NVAR DCOffset_nm = G_PiezoOffset_nm
+	NVAR Counter = G_ActuatorCounter
+	NVAR ActuatorStepAmplitudeCloser = root:Config:VISA:G_ActuatorStepAmplitudeCloser
+	NVAR ActuatorStepSize = G_ActuatorStepSize
+	NVAR ZInstr = root:Config:VISA:G_ZInstr
+
+	SVAR ZActuatorListenStatus= root:Config:VISA:G_ZActuatorListenStatus
+	SVAR Remote= root:Config:VISA:G_Remote
+	SVAR Local= root:Config:VISA:G_Local
+	SVAR SetAmplitudeCloser= root:Config:VISA:G_SetAmplitudeCloser
+	SVAR OneStepCloser= root:Config:VISA:G_OneStepCloser
+
+	Variable keys
+	Variable HighResReadWaveSize= ReadWaveSize * 2
+
+	if (ActuatorStepSize > 5)
+		ActuatorStepSize=5
+	endif
+
+
+	SetAmplitudeCloser = "2SU-" + num2str(ActuatorStepAmplitudeCloser) + "\r"  // changed to axis 2 and reversed.  // SetAmplitudeCloser = "1SU" + num2str(ActuatorStepAmplitudeCloser) + "\r"
+	
+	OneStepCloser= "2PR-" + num2str(ActuatorStepSize) + "\r"  // changed to axis 2 and reversed.  // OneStepCloser= "1PR" + num2str(ActuatorStepSize) + "\r"
+	VISA_Open(ZActuatorName)
+	VISA_Write(ZInstr, Remote)
+
+	VISA_Write(ZInstr, SetAmplitudeCloser)
+
+	Redimension/D/N=(HighResReadWaveSize) HighResReadWave
+	Redimension/D/N=(ReadWaveSize) CurHighResIn, VolHighResIn
+
+	SetUpHRTaskID1()
+	MXCfgSampClkTiming(G_ID1,AcquisitionRate,1,HighResReadWaveSize)
+
+   	Counter=0
+	Actual_Current=0
+
+
+	Do
+		keys= GetKeyState(0)
+		if(keys==2) // ***Shift key pressed?
+			ClearHRTaskID1()
+			VISA_Write(ZInstr, Local)
+			VISA_Close(ZActuatorName)
+			break
+		endif
+
+		MXStartTask(G_ID1)
+		MXReadAnalogF64(G_ID1,10,2,HighResReadWave)
+		MXStopTask(G_ID1)
+
+		VolHighResIn= HighResReadWave[p]
+		CurHighResIn= HighResReadWave[p + ReadWaveSize]
+
+		Actual_Current = Mean(CurHighResIn,100,180)*CurrentVoltConversion // take the mean of points 100-180 in CurHighResIn
+		Print "Approach: actual current= ", Actual_Current, "Voltage= ", Mean(VolHighResIn)
+
+		if(abs(Actual_Current)<.2)
+			VISA_Write(ZInstr, OneStepCloser)
+			Counter+=1
+			DoUpdate // update any objects (string variables, numeric variables, waves, controls) that depend on other objects that have changed since last update
+		else
+			ClearHRTaskID1()
+			VISA_Write(ZInstr, Local)
+			VISA_Close(ZActuatorName)
+			break // command that exits Do-While loop
+		endif
+
+	While(1)
+
+end
+
+Function HighResContact()
+	NVAR ConductanceThreshold= G_ConductanceThreshold
+	NVAR Cond= G_Cond
+
+	Variable StepIn
+	Variable TipBiasContact= 100	// in mV
+
+	StepIn= +2	// piezo step
+
+	Do
+		WriteToHighRes(0, TipBiasContact)
+
+		ReadCurrentAndVoltage()
+
+		if(Cond > ConductanceThreshold)
+			break
+		endif
+		WriteToHighRes(StepIn, TipBiasContact)
+	While(1)
+End
+
+Function HighResMakeContact()
+	Wave ContactCheckWave
+	Wave VolHighResIn, CurHighResIn
+
+	NVAR G_ID1=G_ID1
+	NVAR AcquisitionRate=G_AcquisitionRate
+	NVAR CardTimeout = G_CardTimeout
+	NVAR ReadWaveSize= G_FastReadWaveSize
+
+	NVAR TipBias = G_TipBias
+	NVAR ConductanceThreshold = G_ConductanceThreshold
+	NVAR ApproachStepSize = G_MakeContactApproachStepSize
+	NVAR DCOffset_nm=G_PiezoOffset_nm	// in nm
+	NVAR PiezoChanHigh= G_PiezoChanHigh
+	NVAR PiezoChanLow= G_PiezoChanLow
+	NVAR CurrentVoltGain= G_CurrentVoltGain
+
+	NVAR NoiseThreshold= G_EndOfTraceNoiseThreshold
+
+	NVAR SeriesResistance = G_SeriesResistance
+
+
+	Variable ContactCurrent, AbsCurrent, Conductance, keys
+	Variable RetractionStep= -0.5	// distance in nm that the tip will be retracted if there is contact at beginning
+	Variable AbsVoltage
+	Variable HighResReadWaveSize= ReadWaveSize * 2
+
+	Redimension/D/N=(HighResReadWaveSize) ContactCheckWave
+	Redimension/D/N=(ReadWaveSize) CurHighResIn, VolHighResIn
+
+	MXCfgSampClkTiming(G_ID1,AcquisitionRate,1,ReadWaveSize)
+	MXStartTask(G_ID1)
+	MXReadAnalogF64(G_ID1,10,2,ContactCheckWave)
+	MXStopTask(G_ID1)
+
+	VolHighResIn= ContactCheckWave[p]
+	CurHighResIn= ContactCheckWave[p + ReadWaveSize]
+
+	ContactCurrent = Mean(CurHighResIn) * (10^(-CurrentVoltGain))	// in Amps
+	AbsCurrent= Abs(Mean(CurHighResIn)) * (10^(-CurrentVoltGain))	// in Amps
+
+	AbsVoltage= Abs(Mean(VolHighResIn)) // in Volts
+
+		Conductance= 1/((AbsVoltage/AbsCurrent)*(K_G0))	// in units of G0
+
+
+     if (Conductance > ConductanceThreshold)
+		print "Tip and substrate are in contact at start of MakeContact"
+		print "Attempting to break contacts..."
+		print "Moving out in steps of "+num2str(-RetractionStep)+" nm"
+
+		do
+			if (DCOffset_nm/K_ZPiezoScale<=PiezoChanLow||DCOffset_nm/K_ZPiezoScale>=PiezoChanHigh)
+				print "Could not separate contacts"
+				print "Piezo overextended, voltage= "+num2str(DCOffset_nm/K_ZPiezoScale)
+				return -3
+			endif
+
+			keys= GetKeyState(0)
+			if(keys==2)
+				return -1
+			endif
+
+			WriteToHighRes(RetractionStep,TipBias)	// Move out one (big) step
+			Print "Moved out 1 step"
+
+			MXStartTask(G_ID1)
+			MXReadAnalogF64(G_ID1,10,2,ContactCheckWave)
+			MXStopTask(G_ID1)
+
+		 	VolHighResIn= ContactCheckWave[p]
+			CurHighResIn= ContactCheckWave[p + ReadWaveSize]
+
+			ContactCurrent = Mean(CurHighResIn) * (10^(-CurrentVoltGain))	// in Amps
+			AbsCurrent= Abs(Mean(CurHighResIn)) * (10^(-CurrentVoltGain))	// in Amps
+
+			AbsVoltage= Abs(Mean(VolHighResIn)) // in Volts
+
+
+				Conductance= 1/((AbsVoltage/AbsCurrent)*(K_G0))	// in units of G0
+
+             while(Conductance > NoiseThreshold)
+
+		print "Successfully broke contacts. Moving on."
+
+	EndIf
+
+	do
+		if (DCOffset_nm/K_ZPiezoScale >= PiezoChanHigh||DCOffset_nm/K_ZPiezoScale <= PiezoChanLow)
+			print "Could not make contact"
+			print "Piezo overextended, voltage= "+num2str(DCOffset_nm/K_ZPiezoScale)
+			return -2
+		endif
+
+		keys= GetKeyState(0)
+		if(keys==2)
+			return -1
+		endif
+
+		WriteToHighRes(ApproachStepSize,TipBias)		// move tip in one (little) step
+
+		MXStartTask(G_ID1)
+		MXReadAnalogF64(G_ID1,10,2,ContactCheckWave)
+		MXStopTask(G_ID1)
+
+		VolHighResIn= ContactCheckWave[p]
+		CurHighResIn= ContactCheckWave[p + ReadWaveSize]
+
+		ContactCurrent = Mean(CurHighResIn) * (10^(-CurrentVoltGain))	// in Amps
+		AbsCurrent= Abs(Mean(CurHighResIn)) * (10^(-CurrentVoltGain))	// in Amps
+
+		AbsVoltage= Abs(Mean(VolHighResIn)) // in Volts
+
+			Conductance= 1/((AbsVoltage/AbsCurrent)*(K_G0))	// in units of G0
+
+
+
+		while (Conductance < ConductanceThreshold)
+
+	return 1
+End
+
+Function HighResOutOfContact()
+	NVAR ConductanceThreshold= G_ConductanceThreshold
+	NVAR Cond= G_Cond
+	NVAR NoiseThreshold= G_EndOfTraceNoiseThreshold
+
+	Variable StepOut
+	Variable TipBiasContact= 100	// in mV
+
+	StepOut= -5	// piezo step
+
+	Do
+		WriteToHighRes(0, TipBiasContact)
+
+		ReadCurrentAndVoltage()
+
+		if(Cond < NoiseThreshold)
+			break
+		endif
+		WriteToHighRes(StepOut,TipBiasContact)
+	While(1)
+End
+
+Function IVSignPopup(ctrlName,popNum,popStr) : PopupMenuControl
+	String ctrlName
+	Variable popNum
+	String popStr
+
+	NVAR IVSign= G_IVSignFlag
+
+	if (popNum==1)
+		IVSign=0
+	elseif (popNum==2)
+		IVSign=1
+	endif
+
+End
+
+Function LogHistFromBlocks(ConductanceBlock)
+	Wave ConductanceBlock
+
+	Wave LogHistWave
+	NVAR AcquisitionRate= G_AcquisitionRate
+	NVAR ExcursionRate= G_PullOutRate// in nm/s
+	NVAR Size= G_PseudoTotalLength_nm
+	NVAR PulseFrontEdgePt= G_PulseFrontEdgePoint
+	NVAR ZeroCutoff= G_EndOfTraceNoiseThreshold
+
+	NVAR PushPullCheck= G_PushPullCheck
+	NVAR InitialPullLength= G_InitialPullLength
+	NVAR FinalPullLength= G_FinalPullLength
+
+	NVAR IVCheck= G_IVCheck
+	NVAR IVInitPull= G_IVInitPull
+	NVAR IVFinPull= G_IVFinPull
+
+	NVAR ACHoldCheck= G_ACHoldCheck
+	NVAR ACInitPullLength= G_ACInitPullLength
+	NVAR ACFinPullLength= G_ACFinPullLength
+
+	NVAR HBHoldCheck= G_HBHoldCheck
+	NVAR HBInitPullLength= G_HBInitPullLength
+	NVAR HBFinPullLength= G_HBFinPullLength
+
+	Variable StartDelete=0, NumberToDelete=0, Numpts, i
+
+	if (PushPullCheck==1)
+		StartDelete=round(InitialPullLength/ExcursionRate*AcquisitionRate)
+		NumberToDelete=round((Size-InitialPullLength-FinalPullLength)/ExcursionRate*AcquisitionRate)
+	elseif (IVCheck==1)
+		StartDelete=round(IVInitPull/ExcursionRate*AcquisitionRate)
+		NumberToDelete=round((Size-IVInitPull-IVFinPull)/ExcursionRate*AcquisitionRate)
+	elseif (ACHoldCheck==1)
+      		StartDelete=round(ACInitPullLength/ExcursionRate*AcquisitionRate)
+		NumberToDelete=round((Size-ACInitPullLength-ACFinPullLength)/ExcursionRate*AcquisitionRate)
+	elseif(HBHoldCheck==1)
+	      StartDelete=round(HBInitPullLength/ExcursionRate*AcquisitionRate)
+		NumberToDelete=round((Size-HBInitPullLength-HBFinPullLength)/ExcursionRate*AcquisitionRate)
+	endif
+
+	Redimension/N=1000 LogHistWave
+	Loghistwave = 0
+	Setscale/I x -8,2,"", Loghistwave
+
+	Variable Lowcutoff
+
+	for(i=0; i< 100; i+=1)
+		Make/O/N=(dimsize(ConductanceBlock,0)) Tempwave
+		Tempwave = 0
+		Tempwave[]=ConductanceBlock[p][i]
+
+
+		Redimension/N=((NumPnts(Tempwave)-22)*0.95) Tempwave
+
+		Variable HB_C=0
+		if (HB_C==1)
+			Deletepoints Size/ExcursionRate*AcquisitionRate-5000, 1000, tempwave
+		endif
+             if (PushPullCheck==1||IVCheck==1||ACHoldCheck==1||HBHoldCheck==1)
+			Deletepoints StartDelete, NumberToDelete, tempwave
+		endif
+
+
+		Numpts=Numpnts(Tempwave)
+		Wavestats/Q/R = [Numpts*.95,Numpts*.96] tempwave
+		Lowcutoff = V_avg
+
+		if(Lowcutoff<ZeroCutoff)
+			Tempwave-= Lowcutoff
+			Smooth/B 11, Tempwave
+			Tempwave= log(tempwave)
+			Histogram/A tempwave, Loghistwave
+		endif
+	endfor
+
+	LogHistWave= LogHistWave/100		// Counts/Trace
+
+	DoWindow/F LogHistofBlock
+	if (V_Flag==0)
+		Execute "LogHistOfBlock()"
+	endif
+
+End
+
+Function MainWindowTabProc(ctrlName,tabNum) : TabControl
+	String ctrlName
+	Variable tabNum
+
+	NVAR SubTabNum= G_SubTabNum
+
+	String DAQControls= ControlNameList("",";","*DAQ")
+	String InputParamControls= ControlNameList("",";","*Inputs")
+	String RampOptions= ControlNameList("",";","*Ramps")
+
+	if (tabNum==0)	// DAQ On
+		ModifyControlList InputParamControls disable=1
+		ModifyControlList RampOptions disable=1
+		ModifyControlList DAQControls disable=0
+	elseif (tabNum==1)	// Inputs
+		ModifyControlList DAQControls disable=1
+		ModifyControlList RampOptions disable=1
+		ModifyControlList InputParamControls disable=0
+	elseif (tabNum==2)	// Ramps
+		ModifyControlList DAQControls disable=1
+		ModifyControlList InputParamControls disable=1
+		ModifyControl RampSubTabs_Ramps disable=0
+		ModifyControl check_CustomRamps disable=0
+		SubWindowTabProc("",SubTabNum)
+	endif
+
+End
+
+Function MakeAttempt(ctrlName) : ButtonControl
+	String ctrlName
+	NVAR SingleAttemptFlag= G_SingleAttemptFlag
+	SingleAttemptFlag= 1
+
+	StopBkgdSampling()
+
+	ControlInfo/W=Thermocouples_readout ThermoCheck
+	If(V_Value == 1)
+		StopThermoSampling()
+	EndIf
+
+	MeasureBreakJunctions()
+
+	StartBkgdSampling()
+End
+
+Function MakeDay()
+	String DateStr= Date()
+	Variable comma1= strsearch(DateStr,",",0)
+	Variable comma2= strsearch(DateStr,",",comma1+1)
+	String Day= DateStr[comma2-2,comma2-1]
+
+	String SingleDay
+	if (stringmatch(Day[0]," ")==1)
+		SingleDay= Day[1]
+		Day= "0"+SingleDay
+		Print Day
+	endif
+End
+
+
+Function MakePath()
+	SVAR PathDate= G_PathDate
+
+	String DateStr= Date()
+	Variable comma1= strsearch(DateStr,",",0)
+	Variable comma2= strsearch(DateStr,",",comma1+1)
+
+	String Month
+	String Day= DateStr[comma2-2,comma2-1]
+
+	String SingleDay
+	if (stringmatch(Day[0]," ")==1)
+		SingleDay= Day[1]
+		Day= "0"+SingleDay
+		Print Day
+	endif
+
+	String Year= DateStr[comma2+4,comma2+5]
+
+	if (stringmatch(DateStr,"*Jan*")==1)
+		Month="01"
+	elseif (stringmatch(DateStr,"*Feb*")==1)
+		Month="02"
+	elseif (stringmatch(DateStr,"*Mar*")==1)
+		Month="03"
+	elseif (stringmatch(DateStr,"*Apr*")==1)
+		Month="04"
+	elseif (stringmatch(DateStr,"*May*")==1)
+		Month="05"
+	elseif (stringmatch(DateStr,"*Jun*")==1)
+		Month="06"
+	elseif (stringmatch(DateStr,"*Jul*")==1)
+		Month="07"
+	elseif (stringmatch(DateStr,"*Aug*")==1)
+		Month="08"
+	elseif (stringmatch(DateStr,"*Sep*")==1)
+		Month="09"
+	elseif (stringmatch(DateStr,"*Oct*")==1)
+		Month="10"
+	elseif (stringmatch(DateStr,"*Nov*")==1)
+		Month="11"
+	elseif (stringmatch(DateStr,"*Dec*")==1)
+		Month="12"
+	endif
+
+	PathDate= Year+SetupID+"_"+Month+Day
+	NewPath/O/C Data DataDir+PathDate+"Merge:"
+	Print "name of path: Data"
+	DoWindow/T kwFrame, PathDate
+end
+
+Function MeasureBreakJunctions()
+	NVAR PullOutNumber= G_PullOutNumber
+	NVAR StopNumber= G_StopNumber
+	NVAR PullOutAttempt= G_PullOutAttempt
+	NVAR SingleAttemptFlag= G_SingleAttemptFlag
+
+	Variable keys
+
+	if (PullOutNumber>=StopNumber)
+		return 0
+	endif
+
+	CreateInputs()	// Makes waves for applied bias and piezo
+
+	SetUpHRTaskID1()
+
+	SetUpLRTaskID3()
+
+		do	// Generate desired data
+
+			SmashFun()
+
+			if (SingleBreakJunctionAttempt()==-1)
+				ClearHRTaskID1()
+				ClearLRTaskID3()
+				return -1
+			endif
+
+			keys= GetKeyState(0)
+			if(keys==2)
+				ClearHRTaskID1()
+				ClearLRTaskID3()
+				return 0
+			endif
+
+			if (PullOutAttempt>=1000000000)
+				ClearHRTaskID1()
+				ClearLRTaskID3()
+				Print "Catastrophic failure"
+				return 0
+			endif
+
+			if (SingleAttemptFlag==1)
+				return 0
+			endif
+
+             while (PullOutNumber<StopNumber)	// keep iterating until all the desired traces are created
+
+	ClearHRTaskID1()
+	ClearLRTaskID3()
+
+End
+
+Function MultipleStepActuatorApart(ctrlName) : ButtonControl
+	String ctrlName
+
+	NVAR ActuatorStepSize= G_ActuatorStepSize
+
+	NVAR ZInstr= root:Config:VISA:G_ZInstr
+	SVAR ZActuatorListenStatus= root:Config:VISA:G_ZActuatorListenStatus
+	SVAR SetAmplitudeApart= root:Config:VISA:G_SetAmplitudeApart
+	SVAR Remote= root:Config:VISA:G_Remote
+	SVAR Local= root:Config:VISA:G_Local
+	SVAR OneStepApart= root:Config:G_OneStepApart
+
+	OneStepApart= "2PR" + num2str(ActuatorStepSize) + "\r"  // changed to axis 2 and reversed.  // OneStepApart= "1PR-" + num2str(ActuatorStepSize) + "\r"
+	if(StringMatch(ZActuatorListenStatus,"OFF"))
+		VISA_Open(ZActuatorName)
+	endif
+
+	VISA_Write(ZInstr, Remote)
+	VISA_Write(ZInstr, SetAmplitudeApart)
+	VISA_Write(ZInstr, OneStepApart)
+ 	VISA_Write(ZInstr, Local)
+
+end
+
+Function MultipleStepActuatorCloser(ctrlName) : ButtonControl
+	String ctrlName
+
+	NVAR ActuatorStepSize= G_ActuatorStepSize
+
+	NVAR ZInstr= root:Config:VISA:G_ZInstr
+	SVAR ZActuatorListenStatus= root:Config:VISA:G_ZActuatorListenStatus
+	SVAR SetAmplitudeCloser= root:Config:VISA:G_SetAmplitudeCloser
+	SVAR Remote= root:Config:VISA:G_Remote
+	SVAR Local= root:Config:VISA:G_Local
+	SVAR OneStepCloser= root:Config:G_OneStepCloser
+
+	OneStepCloser= "2PR-" + num2str(ActuatorStepSize) + "\r"  // changed to axis 2 and reversed.  // OneStepCloser= "1PR" + num2str(ActuatorStepSize) + "\r"
+	if(StringMatch(ZActuatorListenStatus,"OFF"))
+		VISA_Open(ZActuatorName)
+	endif
+
+	VISA_Write(ZInstr, Remote)
+	VISA_Write(ZInstr, SetAmplitudeCloser)
+	VISA_Write(ZInstr, OneStepCloser)
+ 	VISA_Write(ZInstr, Local)
+
+end
+
+Function OffsetVoltage()
+	Wave CurrentWave, VoltageWave
+	Wave ConductanceWave
+	Wave TipBiasRamp
+
+	Variable i, Increment
+	Variable HighResReadWaveSize= 5000
+
+	NVAR G_ID1=G_ID1
+	NVAR AcquisitionRate= G_AcquisitionRate
+
+	NVAR TipBias= G_TipBias
+	NVAR NumPts= G_NumPoints
+	NVAR Bound= G_VoltageInterval	// in mV
+	NVAR Vzero= G_Vzero 			// in mV
+	NVAR Izero= G_Izero		// in microAmps
+	NVAR Vol= G_Vol
+	NVAR Cur= G_Cur
+	NVAR Cond= G_Cond
+
+	Redimension/D/N=(2*NumPts) CurrentWave, VoltageWave
+	Redimension/D/N=(2*NumPts) ConductanceWave
+	Redimension/D/N=(2*NumPts) TipBiasRamp
+	CurrentWave=0
+	VoltageWave=0
+	MXCfgSampClkTiming(G_ID1,AcquisitionRate,1,HighResReadWaveSize)
+
+	Increment= Abs(Bound) / NumPts
+
+	For(i= 0; i < 2*NumPts; i+= 1)
+		TipBiasRamp[i] = -Abs(Bound) + Increment * i
+	EndFor
+
+	For(i= 0; i < 2*NumPts; i+= 1)
+		HighResContact()
+		WriteToHighRes(0,TipBiasRamp[i])
+		Sleep/T 60
+		ReadCurrentAndVoltage()
+		VoltageWave[i]= Vol	// voltage in Volts
+		CurrentWave[i]= Cur	// current in micro Amps
+		ConductanceWave[i]= Cond
+		doupdate
+	EndFor
+
+	VoltageWave*= 1e6	// voltage in micro Volts
+	Make/O/N=2 W_coef
+	CurveFit/Q/M=0/W=0 line, kwCWave=W_coef, CurrentWave/X= TipBiasRamp/D
+	Izero= W_coef[0]	// in micro Amps
+	Vzero= -(Izero / W_Coef[1]) // in mV
+	print "zero current (uA) and zero voltage (uV)", Izero, Vzero
+
+	WriteToHighRes(0, TipBias)
+
+End
+
+Function PiezoStepApart(ctrlName) : ButtonControl
+	String ctrlName
+
+	NVAR deltaZ_nm= G_PiezoDeltaZ_nm
+	NVAR TipBias= G_TipBias
+
+	WriteToHighRes(-deltaZ_nm,TipBias)
+
+End
+
+Function PiezoStepCloser(ctrlName) : ButtonControl
+	String ctrlName
+
+	NVAR deltaZ_nm= G_PiezoDeltaZ_nm
+	NVAR TipBias= G_TipBias
+
+	WriteToHighRes(deltaZ_nm,TipBias)
+
+End
+
+Function RampOptionsCheckProc(ctrlName,checkVar) : CheckBoxControl
+	String ctrlName
+	Variable checkVar
+
+	NVAR IVCheck= G_IVCheck
+	NVAR PushPullCheck= G_PushPullCheck
+	NVAR ACHoldCheck= G_ACHoldCheck
+	NVAR HBHoldCheck= G_HBHoldCheck
+
+	if (GrepString(ctrlName,"IVCheck*")==1)
+		IVCheck= checkVar
+		PushPullCheck= 0
+		ACHoldCheck= 0
+		HBHoldCheck= 0
+	elseif (GrepString(ctrlName,"PushPullCheck*")==1)
+		PushPullCheck= checkVar
+		IVCheck= 0
+		ACHoldCheck= 0
+		HBHoldCheck= 0
+	elseif (GrepString(ctrlName,"ACHoldCheck*")==1)
+		ACHoldCheck= checkVar
+		PushPullCheck= 0
+		IVCheck= 0
+		HBHoldCheck= 0
+	elseif (GrepString(ctrlName,"HBHoldCheck*")==1)
+		HBHoldCheck= checkVar
+		ACHoldCheck= 0
+		PushPullCheck= 0
+		IVCheck= 0
+	endif
+
+End
+
+Function ReadCurrentAndVoltage()
+	Wave HighResReadWave
+	Wave CurrentIn, VoltageIn
+
+	NVAR G_ID1=G_ID1
+	NVAR CurrentVoltGain= G_CurrentVoltGain
+	NVAR Vol= G_Vol
+	NVAR Cur= G_Cur
+	NVAR Cond= G_Cond
+
+	Variable AvgVoltageIn, AvgCurrentIn, Conductance
+	Variable HighResReadWaveSize= 5000
+	Variable ReadWaveSize= HighResReadWaveSize / 2
+
+	Variable AmpPerVolt= 10^(-CurrentVoltGain)		// voltage to current conversion factor
+
+	Redimension/D/N=(HighResReadWaveSize) HighResReadWave
+	Redimension/D/N=(ReadWaveSize) CurrentIn, VoltageIn
+
+	MXStartTask(G_ID1)
+	MXReadAnalogF64(G_ID1,10,2,HighResReadWave)
+	MXStopTask(G_ID1)
+
+	VoltageIn= HighResReadWave[p]
+	CurrentIn= HighResReadWave[p+ReadWaveSize]
+
+	AvgVoltageIn= Mean(VoltageIn)		// in Volts
+	AvgCurrentIn= Mean(CurrentIn)		// in microAmps
+
+	Conductance= abs(AvgCurrentIn/AvgVoltageIn)	// in uS
+	Conductance= Conductance / K_G0   // in units of G0 !!
+
+	Vol= AvgVoltageIn
+	Cur= AvgCurrentIn
+	Cond= Conductance
+
+
+End
+
+Function ResetDAQDevices(ctrlName) : ButtonControl
+	String ctrlName
+	NVAR CounterElectrodeBias= G_CounterElectrodeBias
+
+	MXResetDevice("Dev1")
+	MXResetDevice("Dev2")
+
+	DoWindow EChem
+	if(V_Flag)
+		Button StartEChemWriteButton win=EChem, disable=2
+		CounterElectrodeBias= 0
+		SetVariable CounterElectrodeSetVar win=EChem, disable=2
+	endif
+end
+
+Function SaveOffset()
+	Wave OffsetWave
+	Wave PullOutNumberWave
+	Wave ParameterWave
+	Wave IzeroWave
+
+	NVAR PullOutNumber= G_PullOutNumber
+	NVAR Vzero= G_Vzero
+	NVAR Izero= G_Izero
+	NVAR Frequency= G_VzeroFrequency
+	NVAR J= G_J
+	NVAR StopNumber= G_StopNumber
+
+	ControlInfo/W=Thermocouples_Readout VzeroCheckBox
+	if(V_Value == 1)
+		if(Mod(PullOutNumber, Frequency) == 0)
+
+				Redimension/D/N=(StopNumber/Frequency) OffsetWave
+				Redimension/D/N=(StopNumber/Frequency) IzeroWave
+				Redimension/D/N=(StopNumber/Frequency) PullOutNumberWave
+
+				J+= 1
+
+				OffsetVoltage()
+				OffsetWave[J - 1]= Vzero
+				IzeroWave[J - 1]= Izero
+				PullOutNumberWave[J - 1]= PullOutNumber
+
+				Variable i
+				For(i= J; i < StopNumber/Frequency; i+= 1)
+					OffsetWave[i]= NaN
+					IzeroWave[i]= NaN
+					PullOutNumberWave[i]= NaN
+				EndFor
+
+				DoWindow/F Izero
+				if(V_flag==0)
+					execute "Izero()"
+				endif
+
+		endif
+	endif
+
+End
+
+Function SavePullOut()
+	NVAR PullOutNumber=G_PullOutNumber
+	NVAR Size=G_PseudoTotalLength_nm// in nm
+	NVAR Rate=G_PullOutRate// in nm/s
+	NVAR ApproachStepSize = G_MakeContactApproachStepSize
+	NVAR CurrentVoltConversion=G_CurrentVoltConversion
+	NVAR TipBias = G_TipBias
+	NVAR ConductanceThreshold = G_ConductanceThreshold
+	NVAR CurrentSuppress = G_CurrentSuppress // in picoAmps (Keithley in MicroAmps?)
+	NVAR SuppressVolt = G_SuppressVolt
+	NVAR PiezoOffset_nm=G_PiezoOffset_nm	// in nm
+	NVAR PiezoOffset_nm=G_PiezoOffset_nm	// in nm
+	NVAR SeriesResistance = G_SeriesResistance
+	NVAR PullOutTime= G_PullOutDatetime
+
+	NVAR TipTCAvg=G_TipTCAvg
+	NVAR SubTCAvg=G_SubTCAvg
+
+	SVAR PathDate=G_PathDate
+
+	NVAR CurrentSave=G_CurrentSaveCheck
+	NVAR BiasSave=G_BiasSaveCheck
+	NVAR SenseSave= G_SenseSaveCheck
+	NVAR HistSave=G_HistSaveCheck
+	NVAR PiezoWaveSave=G_PiezoWaveSaveCheck
+
+	NVAR Vzero= G_Vzero
+	NVAR Izero= G_Izero
+
+	Wave PullOutVoltage, PullOutConductance, PullOutCurrent
+	Wave SenseIn, POExtension
+	Wave PiezoBiasWave
+	Wave ParameterWave, PullOutConductanceSave
+	Wave LogHistWave
+
+	Variable StartX= Mean(SenseIn,0,999)
+	Variable StopX= Mean(SenseIn,numpnts(SenseIn)-1000,numpnts(SenseIn)-1)
+
+	ParameterWave[0] = Size
+	ParameterWave[1] = Rate
+	ParameterWave[2] = ApproachStepSize
+	ParameterWave[3] = PiezoOffset_nm
+	ParameterWave[4] = BiasSave
+	ParameterWave[5] = StartX-StopX
+	ParameterWave[6] = TipTCAvg
+	ParameterWave[7] = SubTCAvg
+	ParameterWave[8] =  0
+	ParameterWave[9] = CurrentVoltConversion
+	ParameterWave[10] = TipBias
+	ParameterWave[11] = 0
+	ParameterWave[12] = SeriesResistance
+	ParameterWave[13] = ConductanceThreshold
+	ParameterWave[14] = 0
+	ParameterWave[15] = Vzero
+	ParameterWave[16] =  Izero
+	ParameterWave[17] = PullOutTime
+	ParameterWave[19] = CurrentSuppress
+
+	if(mod(PullOutNumber,100)==1)
+
+		Make/O/N=(Numpnts(PullOutConductance) +2+numpnts(ParameterWave),100) ConductanceBlock=NAN
+
+		if (BiasSave==1)
+			Make/O/N=(Numpnts(PullOutVoltage),100) VoltageBlock=NAN
+			SetScale/I x 0, Size, "" VoltageBlock
+		endif
+
+		if (CurrentSave==1)
+			Make/O/N=(Numpnts(PullOutCurrent),100) CurrentBlock=NAN
+			SetScale/I x 0, Size, "" CurrentBlock
+		endif
+
+		if (SenseSave==1)
+			Make/O/N=(Numpnts(POExtension),100) ExtensionBlock=NAN
+			SetScale/I x 0, Size, "" ExtensionBlock
+		endif
+
+	endif
+
+	Variable i
+	Variable k=numpnts(PullOutConductance)
+	Wave PullOutConductanceSave, POCondHist
+	Redimension/N=(k) PullOutConductanceSave
+	PullOutConductanceSave = PullOutConductance
+	Redimension/N=(k+2+numpnts(ParameterWave)) PullOutConductanceSave
+
+	for (i=0;i<numpnts(ParameterWave);i+=1)
+		PullOutConductanceSave[k+i+2]=ParameterWave[i]
+	endfor
+
+	variable m = 0
+	for(m=0; m<numpnts(PullOutConductanceSave); m+=1)
+		ConductanceBlock[m][mod(PullOutNumber-1,100)]=PullOutConductanceSave[m]
+	endfor
+
+	if (BiasSave==1)	// Save measured voltage
+		m=0
+		for(m=0; m<numpnts(PullOutVoltage); m+=1)
+			VoltageBlock[m][mod(PullOutNumber-1,100)]=PullOutVoltage[m]
+		endfor
+	endif
+
+	if (CurrentSave==1)	// Save current
+		m=0
+		for(m=0; m<numpnts(PullOutCurrent); m+=1)
+			CurrentBlock[m][mod(PullOutNumber-1,100)]=PullOutCurrent[m]
+		endfor
+	endif
+
+	if (SenseSave==1) 	// Save Piezo
+		m=0
+		for(m=0; m<numpnts(POExtension); m+=1)
+			ExtensionBlock[m][mod(PullOutNumber-1,100)] = POExtension[m]
+		endfor
+	endif
+
+
+	if(mod(PullOutNumber,100)==0 && WaveExists(ConductanceBlock))
+		String ConductanceBlockName="PullOutConductanceBlock_"+Num2Str(Round(PullOutNumber/100))
+		Duplicate/O ConductanceBlock $ConductanceBlockName
+		Save/C/P=Data $ConductanceBlockName
+
+		if(BiasSave==1)
+			String Voltage="PullOutVoltageBlock_"+Num2Str(Round(PullOutNumber/100))
+			Duplicate/O VoltageBlock $Voltage
+			Save/C/P=Data $Voltage
+			Killwaves $Voltage, VoltageBlock
+		else
+			String Voltage2="PullOutVoltage_"+Num2Str(PullOutNumber)
+			Duplicate/O PullOutVoltage $Voltage2
+			Save/C/P=Data $Voltage2
+			Killwaves $Voltage2
+		endif
+
+		if(CurrentSave==1)
+			String Current="PullOutCurrentBlock_"+Num2Str(Round(PullOutNumber/100))
+			Duplicate/O CurrentBlock $Current
+			Save/C/P=Data $Current
+			Killwaves $Current, CurrentBlock
+		else
+			String Current2="PullOutCurrent_"+Num2Str(PullOutNumber)
+			Duplicate/O PullOutCurrent $Current2
+			Save/C/P=Data $Current2
+			Killwaves $Current2
+		endif
+
+		if(SenseSave==1)
+			String ExtensionBlockName="PullOutExtensionBlock_"+Num2Str(Round(PullOutNumber/100))
+			Duplicate/O ExtensionBlock $ExtensionBlockName
+			Save/C/P=Relocate $ExtensionBlockName
+			killwaves $ExtensionBlockName, ExtensionBlock
+		else
+			String Extension2="PullOutExtension_"+Num2Str(PullOutNumber)
+			Duplicate/O POExtension $Extension2
+			Save/C/P=Data $Extension2
+			Killwaves $Extension2
+		endif
+
+             if(PiezoWaveSave==1)
+			String PiezoBiasWaveName="PullOutPiezoBiasWave_"+Num2Str(Round(PullOutNumber/100))
+			Duplicate/O PiezoBiasWave, $PiezoBiasWaveName
+			Save/C/P=Data $PiezoBiasWaveName
+			killwaves $PiezoBiasWaveName
+		endif
+
+		LogHistFromBlocks(ConductanceBlock)
+
+		if (HistSave==1)
+	        	String ConductanceBlockHistname = "PullOutConductanceBlockHist_" +Num2Str(Round(PullOutNumber/100))
+			Duplicate/O LoghistWave, $ConductanceBlockHistname
+			Save/C/P=Data $ConductanceBlockHistName
+			Killwaves  $ConductanceBlockHistName	// Don't kill LogHistWave-- it is displayed during measurement
+		endif
+
+		killwaves $ConductanceBlockName, ConductanceBlock
+
+		SaveExperiment/P=Data/F={1,"",2} as "Experiment.pxp"
+	endif
+
+	PullOutNumber+=1
+	Beep
+	DoWindow/T kwFrame, "Exp: "+num2str(pulloutnumber) + " "+num2str(round(PiezoOffset_nm))
+
+	DoUpdate
+End
+
+Function SetPiezoBiasFromSlider(name, value, event) : SliderControl			// slider sets Offset
+	String name
+	Variable value
+	Variable event
+
+	NVAR DCOffset_nm= G_PiezoOffset_nm
+	NVAR TipBias= G_TipBias
+	Variable deltaZ_nm= value*K_ZPiezoScale-DCOffset_nm
+
+	WriteToHighRes(deltaZ_nm,TipBias)
+
+End
+
+Function SetStepAmplitudeApart(ctrlName,varNum,varStr,varName) : SetVariableControl
+	String ctrlName, varStr, varName
+	Variable varNum
+
+	NVAR ActuatorStepAmplitudeApart= root:Config:VISA:G_ActuatorStepAmplitudeApart
+	SVAR SetAmplitudeApart= root:Config:VISA:G_SetAmplitudeApart
+
+	ActuatorStepAmplitudeApart=varNum
+	SetAmplitudeApart = "2SU" + num2str(ActuatorStepAmplitudeApart) + "\r"  // changed to axis 2 and reversed. // SetAmplitudeApart = "1SU-" + num2str(ActuatorStepAmplitudeApart) + "\r"
+end
+
+Function SetStepAmplitudeCloser(ctrlName,varNum,varStr,varName) : SetVariableControl
+	String ctrlName, varStr, varName
+	Variable varNum
+
+	NVAR ActuatorStepAmplitudeCloser= root:Config:VISA:G_ActuatorStepAmplitudeCloser
+	SVAR SetAmplitudeCloser= root:Config:VISA:G_SetAmplitudeCloser
+
+	ActuatorStepAmplitudeCloser=varNum
+	SetAmplitudeCloser = "2SU-" + num2str(ActuatorStepAmplitudeCloser) + "\r"  // changed to axis 2 and reversed. // SetAmplitudeCloser = "1SU" + num2str(ActuatorStepAmplitudeCloser) + "\r"
+end
+
+Function SetTipBiasVoltage(ctrlName,varNum,varStr,varName) : SetVariableControl
+	String ctrlName
+	Variable varNum
+	String varStr
+	String varName
+
+	NVAR TipBias = G_TipBias	//-(TipBias/1000)
+
+
+	WriteToHighRes(0,TipBias)
+end
+
+Function SetUpHRTaskID1()
+	NVAR G_ID1=G_ID1
+
+	MXCreateTask("G_ID1");
+	MXCreateAIVoltageChan(G_ID1,HighResVoltageIn,-10,10); // sets up HighRes analog input to read voltage (taskHandle=G_ID1, chan=HighResVoltageIn, min=-10, max=10)
+	MXCreateAIVoltageChan(G_ID1,HighResCurrentIn,-10,10); // sets up HighRes analog input to read current
+End
+
+Function SetUpLRTaskID3()
+	NVAR G_ID3=G_ID3
+	NVAR AcquisitionRate=G_AcquisitionRate
+
+	NVAR NumPtsInAppliedWaves=G_NumPtsInAppliedWaves
+	Variable NumPtsIn= NumPtsInAppliedWaves+3000
+
+	MXCreateTask("G_ID3")
+	MXCreateAIVoltageChan(G_ID3,LowResCurrentIn,-10,10)
+	MXCreateAIVoltageChan(G_ID3,LowResVoltageIn,-10,10)
+	MXCreateAIVoltageChan(G_ID3,LowResPiezoIn,-10,10)
+
+	ControlInfo/W=Thermocouples_readout ThermoCheck
+	if(V_Value)
+		MXCreateAIVoltageChan(G_ID3,TCchan4,-0.001,0.001)
+		MXCreateAIVoltageChan(G_ID3,TCchan5,-0.001,0.001)
+	endif
+
+	MXCfgSampClkTiming(G_ID3,AcquisitionRate,1,NumPtsIn)
+End
+
+Function SetupVISASerialPort(Instr)
+	Variable Instr
+	Variable Status
+
+	Variable baud = 921600
+	Status = viSetAttribute(Instr, VI_ATTR_ASRL_BAUD, baud)
+	if (Status < 0)         // Error
+		return Status
+	endif
+
+	Variable dataBits = 8
+	Status = viSetAttribute(Instr, VI_ATTR_ASRL_DATA_BITS, dataBits)
+	if (Status < 0)         // Error
+		return Status
+	endif
+
+	Variable parity = VI_ASRL_PAR_NONE
+	Status = viSetAttribute(Instr, VI_ATTR_ASRL_PARITY, parity)
+	if (Status < 0)         // Error
+		return Status
+	endif
+
+	Variable stopBits = VI_ASRL_STOP_ONE
+	Status = viSetAttribute(Instr, VI_ATTR_ASRL_STOP_BITS, stopBits)
+	if (Status < 0)         // Error
+		return Status
+	endif
+
+
+	Variable timeout = 300
+	Status = viSetAttribute(Instr, VI_ATTR_TMO_VALUE, timeout)
+	if (Status < 0)         // Error
+		return Status
+	endif
+
+	Variable flowControl = VI_ASRL_FLOW_NONE
+	Status = viSetAttribute(Instr, VI_ATTR_ASRL_FLOW_CNTRL, flowControl)
+	if (Status < 0)         // Error
+		return Status
+	endif
+
+	return 0
+end
+
+Function SingleBreakJunctionAttempt()
+	NVAR PullOutAttempt= G_PullOutAttempt
+
+	Variable MakeContactReturnVal
+
+	PullOutAttempt+=1
+
+	MakeContactReturnVal=HighResMakeContact()
+
+	if (MakeContactReturnVal==1)
+		if (GenerateTrace()==1)
+			if(TestTrace()==1)
+				SaveOffset()
+				SavePullOut()
+				CreateInputs()
+			endif
+		endif
+	elseif (MakeContactReturnVal<-1)
+		return -1
+	endif
+
+End
+
+Function SmashFun()
+	NVAR PullOutAttempt= G_PullOutAttempt
+	NVAR SmashNum= G_SmashFrequency
+	NVAR SmashInSteps= G_SmashInSteps
+	NVAR SmashOutSteps= G_SmashOutSteps
+	NVAR TipBias= G_TipBias
+
+	if (mod(PullOutAttempt,SmashNum)==0)
+		WriteToHighRes(SmashInSteps,TipBias)
+		WriteToHighRes(SmashOutSteps,TipBias)
+		Print "Smashed Tip"
+	endif
+End
+
+Function StartBkgdSampling()
+	NVAR G_ID1 = G_ID1
+	NVAR G_ID2 = G_ID2
+	NVAR CardTimeout = G_CardTimeout;
+	NVAR ReadWaveSize = G_FastReadWaveSize
+	NVAR AcquisitionRate = G_AcquisitionRate
+
+	Variable HighResReadWaveSize
+	HighResReadWaveSize = ReadWaveSize * 2 // *2 to read voltage and current in same command and save into a single wave
+
+	MXCreateTask("G_ID2");
+	MXCreateAIVoltageChan(G_ID2,LowResPiezoIn,-10,10);
+	MXCfgSampClkTiming(G_ID2,AcquisitionRate,0,ReadWaveSize) // sets source of Sample Clock, rate of Sample Clock and number of samples to acquire or generate
+
+	SetUpHRTaskID1() // sets up HighRes voltage and current inputs
+	MXCfgSampClkTiming(G_ID1,AcquisitionRate,1,HighResReadWaveSize) // sets source of Sample Clock, rate of Sample Clock and number of samples to acquire or generate
+
+	CtrlNamedBackground BkgdRead, period=15, proc=BackgroundRead // defines background task called BkgdRead, refers to BackgroundRead user function, period defines minimum time that must pass between bkgd task invocations, =15 means approx. 15/60 s
+	CtrlNamedBackground BkgdRead, start // starts background task called BkgdRead
+	CheckBox OnCheck win=BreakJunctionMeasurement, value=1 // unchecks OnCheck checkbox in BreakJunctionMeasurement window
+end
+
+Function StartHighResWritingTask(ctrlName) : ButtonControl
+	String ctrlName
+
+	Wave HighResWriteWave
+
+	NVAR G_OD1= G_OD1
+	NVAR rate= G_AcquisitionRate
+	NVAR PiezoOffset_nm= G_PiezoOffset_nm
+	NVAR CardTimeout= G_CardTimeout;
+	NVAR WriteBufferSize= G_WriteBufferSize;
+	NVAR TipBias= G_TipBias	//-(TipBias/1000)
+	NVAR PiezoChanLow= G_PiezoChanLow
+	NVAR PiezoChanHigh= G_PiezoChanHigh
+	NVAR HighResOutputRange= G_HighResOutputRange
+
+	Redimension/D/N=(WriteBufferSize*2) HighResWriteWave
+	HighResWriteWave[0,WriteBufferSize-1]= PiezoOffset_nm/K_ZPiezoScale;
+	HighResWriteWave[WriteBufferSize,2*WriteBufferSize-1]= -(TipBias/1000)
+
+	Variable HighResOutputRange_1 = HighResOutputRange
+	Variable HighResOutputRange_2 = -HighResOutputRange
+
+	MXCreateTask("G_OD1")
+	MXCreateAOVoltageChan(G_OD1,HighResPiezoOut,PiezoChanLow,PiezoChanHigh)
+	MXCreateAOVoltageChan(G_OD1,HighResBiasOut, HighResOutputRange_2,HighResOutputRange_1)
+	MXCfgSampClkTiming(G_OD1,rate,1,WriteBufferSize)
+	MXWriteAnalogF64(G_OD1,CardTimeout,2,HighResWriteWave)
+	MXStartTask(G_OD1)
+
+
+	SetUpFemto()
+
+	DoWindow/F Current_Measurement
+	Button Start_DAQ disable=2
+	Button Reset_DAQ disable=2
+	Button Stop_DAQ disable=0
+	Slider SliderPos_Z win=BreakJunctionMeasurement, disable=0
+	SetVariable WriteBufferSize_DAQ disable=2
+	SetVariable ReadWaveSize_DAQ disable=2
+	SetVariable AcqRate_DAQ disable=2
+	CheckBox OnCheck disable=0
+End
+
+Function StartMeasurement(ctrlName) : ButtonControl
+	String ctrlName
+	NVAR SingleAttemptFlag= G_SingleAttemptFlag
+	SingleAttemptFlag= 0
+
+	StopBkgdSampling()
+
+	ControlInfo/W=Thermocouples_readout ThermoCheck
+	If(V_Value == 1)
+		StopThermoSampling()
+	EndIf
+
+	MeasureBreakJunctions()
+
+	StartBkgdSampling()
+
+	ControlInfo/W=Thermocouples_readout ThermoCheck
+	If(V_Value == 1)
+		StartThermoSampling()
+	EndIf
+End
+
+Function StepActuatorApart(ctrlName) : ButtonControl
+	String ctrlName
+
+	NVAR ZInstr= root:Config:VISA:G_ZInstr
+	NVAR ActuatorStepAmplitudeApart= root:Config:VISA:G_ActuatorStepAmplitudeApart
+	NVAR ActuatorStepSize= G_ActuatorStepSize
+
+	SVAR ZActuatorListenStatus= root:Config:VISA:G_ZActuatorListenStatus
+	SVAR Remote= root:Config:VISA:G_Remote
+	SVAR Local= root:Config:VISA:G_Local
+	SVAR SetAmplitudeApart= root:Config:VISA:G_SetAmplitudeApart
+	SVAR OneStepApart= root:Config:VISA:G_OneStepApart
+
+	VISA_Open(ZActuatorName)
+
+	VISA_Write(ZInstr, Remote)
+
+	SetAmplitudeApart = "2SU" + num2str(ActuatorStepAmplitudeApart) + "\r"  // changed to axis 2 and reversed. // SetAmplitudeApart = "1SU-" + num2str(ActuatorStepAmplitudeApart) + "\r"
+	VISA_Write(ZInstr, SetAmplitudeApart)
+
+	OneStepApart= "2PR" + num2str(ActuatorStepSize) + "\r"  // changed to axis 2 and reversed. // OneStepApart= "1PR-" + num2str(ActuatorStepSize) + "\r"
+	VISA_Write(ZInstr, OneStepApart)
+
+	VISA_Write(ZInstr, Local)
+
+	VISA_Close(ZActuatorName)
+end
+
+Function StepActuatorCloser(ctrlName) : ButtonControl
+	String ctrlName
+
+	NVAR ZInstr= root:Config:VISA:G_ZInstr
+	NVAR ActuatorStepAmplitudeCloser= root:Config:VISA:G_ActuatorStepAmplitudeCloser
+	NVAR ActuatorStepSize= G_ActuatorStepSize
+
+	SVAR ZActuatorListenStatus= root:Config:VISA:G_ZActuatorListenStatus
+	SVAR Remote= root:Config:VISA:G_Remote
+	SVAR Local= root:Config:VISA:G_Local
+	SVAR SetAmplitudeCloser= root:Config:VISA:G_SetAmplitudeCloser
+	SVAR OneStepCloser= root:Config:VISA:G_OneStepCloser
+
+	VISA_Open(ZActuatorName)
+	VISA_Write(ZInstr, Remote)
+
+	SetAmplitudeCloser = "2SU-" + num2str(ActuatorStepAmplitudeCloser) + "\r"  // changed to axis 2 and reversed. // SetAmplitudeCloser = "1SU" + num2str(ActuatorStepAmplitudeCloser) + "\r"
+	VISA_Write(ZInstr, SetAmplitudeCloser)
+
+	OneStepCloser= "2PR-" + num2str(ActuatorStepSize) + "\r"  // changed to axis 2 and reversed. // OneStepCloser= "1PR" + num2str(ActuatorStepSize) + "\r"
+	VISA_Write(ZInstr, OneStepCloser)
+
+	VISA_Write(ZInstr, Local)
+
+	VISA_Close(ZActuatorName)
+end
+
+Function StepActuatorPosX(ctrlName) : ButtonControl
+	String ctrlName
+
+	NVAR ActuatorStepSize= G_ActuatorStepSize
+
+	NVAR XYInstr= root:Config:VISA:G_XYInstr
+	SVAR XYActuatorListenStatus= root:Config:VISA:G_XYActuatorListenStatus
+	SVAR Remote= root:Config:VISA:G_Remote
+	SVAR Local= root:Config:VISA:G_Local
+
+	String OneStepPosX= "1PR" + num2str(ActuatorStepSize) + "\r"
+
+		VISA_Open(XYActuatorName)
+
+	VISA_Write(XYInstr, Remote)
+	VISA_Write(XYInstr, OneStepPosX)
+	VISA_Write(XYInstr, Local)
+
+	VISA_Close(XYActuatorName)
+end
+
+Function StepActuatorNegX(ctrlName) : ButtonControl
+	String ctrlName
+
+	NVAR ActuatorStepSize= G_ActuatorStepSize
+
+	NVAR XYInstr= root:Config:VISA:G_XYInstr
+	SVAR XYActuatorListenStatus= root:Config:VISA:G_XYActuatorListenStatus
+	SVAR Remote= root:Config:VISA:G_Remote
+	SVAR Local= root:Config:VISA:G_Local
+
+	String OneStepNegX= "1PR-" + num2str(ActuatorStepSize) + "\r"
+
+		VISA_Open(XYActuatorName)
+
+	VISA_Write(XYInstr, Remote)
+	VISA_Write(XYInstr, OneStepNegX)
+	VISA_Write(XYInstr, Local)
+
+	VISA_Close(XYActuatorName)
+end
+
+Function StopActuatorMovement(ctrlName) : ButtonControl
+	String ctrlName
+
+	NVAR ZInstr= root:Config:VISA:G_ZInstr
+
+	SVAR ZActuatorListenStatus= root:Config:VISA:G_ZActuatorListenStatus
+	SVAR Remote= root:Config:VISA:G_Remote
+	SVAR Local= root:Config:VISA:G_Local
+
+	String Stop= "2ST\r"                                                             // changed to axis 2 and reversed. // String Stop= "1ST\r"
+
+	if(StringMatch(ZActuatorListenStatus,"ON"))
+		VISA_Write(ZInstr, Remote)
+		VISA_Write(ZInstr, Stop)
+		VISA_Write(ZInstr, Local)
+	endif
+
+end
+
+Function StopBkgdSampling()
+	NVAR G_ID1=G_ID1
+	NVAR G_ID2=G_ID2
+
+	CtrlNamedBackground BkgdRead, stop // stops BkdgRead named background task
+
+	MXClearTask(G_ID1)
+	MXClearTask(G_ID2)
+	CheckBox OnCheck win=BreakJunctionMeasurement, value=0 // unchecks OnCheck checkbox in BreakJunctionMeasurement window
+end
+
+Function StopWritingTasks(ctrlName) : ButtonControl
+	String ctrlName
+
+	NVAR G_OD1= G_OD1
+	NVAR G_ID1= G_ID1
+	NVAR G_AO1
+	NVAR G_DO1
+	NVAR DCOffset_nm= G_PiezoOffset_nm
+	NVAR TipBias= G_TipBias
+	NVAR CounterElectrodeBias= G_CounterElectrodeBias
+
+	StopBkgdSampling()
+
+	WriteToHighRes(-DCOffset_nm,TipBias)
+
+	MXStopTask(G_OD1)
+	MXClearTask(G_OD1)
+	MXStopTask(G_AO1)
+	MXClearTask(G_AO1)
+	MXStopTask(G_DO1)
+	MXClearTask(G_DO1)
+
+	DoWindow/F BreakJunctionMeasurement
+
+	Button Start_DAQ disable=0
+	Button Reset_DAQ disable=0
+	Slider SliderPos_Z win=BreakJunctionMeasurement, disable=2
+	SetVariable WriteBufferSize_DAQ disable=0
+	SetVariable ReadWaveSize_DAQ disable=0
+	SetVariable AcqRate_DAQ disable=0
+
+	CounterElectrodeBias= 0
+
+	DoWindow EChem
+	if(V_flag)
+		Button StartEChemWriteButton win=EChem, disable=2
+		SetVariable CounterElectrodeSetVar win=EChem, disable=2
+	endif
+
+	MainWindowTabProc("",0)
+end
+
+Function SubWindowTabProc(ctrlName,tabNum) : TabControl
+	String ctrlName
+	Variable tabNum
+
+	NVAR SubTabNum= G_SubTabNum
+	SubTabNum= tabNum
+
+	String PushPullControls= ControlNameList("",";","*PushPullRamps")
+	String IVControls= ControlNameList("",";","*IVRamps")
+	String ACHoldOptions= ControlNameList("",";","*ACHoldRamps")
+	String HBHoldOptions= ControlNameList("",";","*HBHoldRamps")
+
+	if (tabNum==0)	// PushPull
+		ModifyControlList IVControls disable=1
+		ModifyControlList ACHoldOptions disable=1
+		ModifyControlList HBHoldOptions disable=1
+		ModifyControlList PushPullControls disable=0
+	elseif (tabNum==1)	// IV
+		ModifyControlList PushPullControls disable=1
+		ModifyControlList ACHoldOptions disable=1
+		ModifyControlList HBHoldOptions disable=1
+		ModifyControlList IVControls disable=0
+	elseif (tabNum==2)	// AC Hold
+		ModifyControlList PushPullControls disable=1
+		ModifyControlList IVControls disable=1
+		ModifyControlList HBHoldOptions disable=1
+		ModifyControlList ACHoldOptions disable=0
+	elseif (tabNum==3)
+		ModifyControlList PushPullControls disable=1
+		ModifyControlList IVControls disable=1
+		ModifyControlList ACHoldOptions disable=1
+		ModifyControlList HBHoldOptions disable=0
+	endif
+
+End
+
+Function TestTrace()
+	NVAR PulseFrontEdgePt=G_PulseFrontEdgePt
+	NVAR ZeroCutOff = G_EndOfTraceNoiseThreshold
+	NVAR PullOutAttempt = G_PullOutAttempt
+	NVAR EngageConductance = G_ConductanceThreshold
+	Wave PullOutConductance, HistLowG, EndConductance
+
+	Variable Mean_EndCond, Dev_Conductance, PointsPerTrace, HistSum
+	Make/O/N=1 CondHist
+
+	PointsPerTrace=numpnts(PullOutConductance)
+	WaveStats/Q/R=[PointsPerTrace*0.94, PointsPerTrace*0.95] PullOutConductance
+	Mean_EndCond = V_avg
+	Dev_Conductance = V_adev
+	if (abs(V_avg)<ZeroCutoff)  // end of PullOutConductance is not close to zero
+		WaveStats/Q/R=[0,round(PointsPerTrace/200)] PullOutConductance
+			if (abs(V_avg)>EngageConductance)
+				HistSum=0
+				CondHist=0
+				Histogram/B={0.1,.1,40} PullOutConductance CondHist
+				HistSum=sum(condhist,0.5,2.5)
+				if (Dev_Conductance < .01)
+					if (HistSum>10)	// Save if there are enough low conductance points
+						return 1
+					else
+						return -1
+					endif
+				else
+					printf("Avg = %3.3e, Dev = %3.3e\r"),  Mean_EndCond, Dev_Conductance
+					return -1
+				endif
+			else
+				printf " No Contact, Deviation = %2.6f\r, Average = %2.6f\r",V_adev, V_avg
+				return -1
+			endif
+	else
+		print "Ending G= "+num2str(Mean_EndCond)+" > ZeroCutoff"
+		return -1
+	endif
+
+	HistLowG=0
+	Histogram/b={.1, 0.1, 40} Pulloutconductance HistLowG
+	if(sum(HistLowG,0.5,2.5)<10)
+		print "No Low G features",PullOutAttempt
+		return -1
+	endif
+
+	return 1
+End
+
+Function VISA_Close(ActuatorName)
+	String ActuatorName
+
+	NVAR ZSession= root:Config:VISA:G_ZSession
+	NVAR ZInstr= root:Config:VISA:G_ZInstr
+	NVAR XYSession= root:Config:VISA:G_XYSession
+	NVAR XYInstr= root:Config:VISA:G_XYInstr
+
+	SVAR ZActuatorListenStatus= root:Config:VISA:G_ZActuatorListenStatus
+	SVAR XYActuatorListenStatus= root:Config:VISA:G_XYActuatorListenStatus
+
+	Variable Instr, Session
+
+	if(StringMatch(ActuatorName, ZActuatorName))
+		Instr= ZInstr
+		Session= ZSession
+		ZActuatorListenStatus= "OFF"
+	elseif(StringMatch(ActuatorName, XYActuatorName))
+		Instr= XYInstr
+		Session= XYSession
+		XYActuatorListenStatus= "OFF"
+	endif
+
+	viClose(Instr)
+	viClose(Session)
+
+end
+
+Function VISA_Open(ActuatorName)
+	String ActuatorName
+	NVAR ZSession= root:Config:VISA:G_ZSession
+	NVAR ZInstr= root:Config:VISA:G_ZInstr
+	NVAR XYSession= root:Config:VISA:G_XYSession
+	NVAR XYInstr= root:Config:VISA:G_XYInstr
+
+	SVAR ZActuatorListenStatus= root:Config:VISA:G_ZActuatorListenStatus
+	SVAR XYActuatorListenStatus= root:Config:VISA:G_XYActuatorListenStatus
+
+	Variable Instr, Session
+	Variable Status
+	String ErrDescription
+
+
+	Status = viOpenDefaultRM(Session)
+
+	if (Status < 0)
+		viStatusDesc(Session, Status, ErrDescription)
+		Print "Z-axis actuator control: " + "error in initializing VISA " + "viOpenDefaultRM ";
+		Print "Error: " + num2str(Status)
+		Print ErrDescription
+		return Status
+	endif
+
+	Status =	 viOpen(Session, ActuatorName, 0, 0, Instr)
+
+	if (Status < 0)
+		VISA_Close(ActuatorName)
+		viStatusDesc(Session, Status, ErrDescription)
+		Print "Actuator control: " + "error in initializing VISA " + "viOpen ";
+		Print "Error: " + num2str(Status)
+		Print ErrDescription
+		return Status
+	endif
+
+	SetupVISASerialPort(Instr)
+
+	if(StringMatch(ActuatorName, ZActuatorName))
+		ZActuatorListenStatus= "ON"
+		ZSession= Session
+		ZInstr= Instr
+	elseif(StringMatch(ActuatorName, XYActuatorName))
+		XYActuatorListenStatus= "ON"
+		XYSession= Session
+		XYInstr= Instr
+	endif
+
+end
+
+Function VISA_Write(Instr, Command)
+	Variable Instr
+	String Command
+
+	VISAWrite Instr, Command
+
+	if(V_flag == 0)
+		print "Actuator control: " + "error in VISA write operation " + "VISA_Write."
+		return -1
+	endif
+
+	return 0
+end
+
+Function WriteToHighRes(deltaZ_nm,TipBias)
+	Variable deltaZ_nm, TipBias
+
+	Wave HighResWriteWave
+	NVAR DCOffset_nm= G_PiezoOffset_nm	// in nm
+	NVAR G_OD1= G_OD1;		// Task Variable for output channel
+	NVAR CardTimeout= G_CardTimeout;
+	NVAR WriteBufferSize= G_WriteBufferSize;
+	NVAR AcquisitionRate= G_AcquisitionRate
+
+	Variable DCOffset
+
+	DCOffset_nm= DCOffset_nm + deltaZ_nm
+	DCOffset= DCOffset_nm / K_ZPiezoScale
+
+	Redimension/D/N=(WriteBufferSize*2) HighResWriteWave
+
+	HighResWriteWave[0,WriteBufferSize-1]= DCOffset
+	HighResWriteWave[WriteBufferSize,WriteBufferSize*2-1]= -(TipBias/1000)
+
+	MXWriteAnalogF64(G_OD1,CardTimeout,2,HighResWriteWave)
+	if (GetRTError(1))
+	endif
+
+	Slider SliderPos_Z win=BreakJunctionMeasurement, value=DCOffset_nm/K_ZPiezoScale
+End
+
+Function VzeroCheckProc(ctrlName,checked) : CheckBoxControl
+	String ctrlName
+	Variable checked
+
+End
+
+Function ZeroCheckProc(ctrlName,checked) : CheckBoxControl
+	String ctrlName
+	Variable checked
+
+	NVAR BoardUD=G_BoardUD
+	NVAR DeviceUD=G_DeviceUD
+	GPIB2 board=BoardUD
+	GPIB2 device=DeviceUD
+	if(checked==0)
+		GPIBWrite2 "C0X"
+	else
+		GPIBWrite2 "C1X"
+	endif
+End
+
+
+
+Function MeasureResistance()
+	String ctrlName
+
+	NVAR TipBias= G_TipBias
+	NVAR AcquisitionRate= G_AcquisitionRate
+
+	Variable NumTest
+	Variable i
+	Variable ReadWaveSize
+
+	NumTest = 19
+	ReadWaveSize = 200
+	Make/O/N=(NumTest) BiasTest
+	Make/O/N=(NumTest) CircuitCurrent
+
+	BiasTest= 0
+	CircuitCurrent= 0
+
+	Make/O/N=200 CurrentWave
+	CurrentWave= 0
+
+	For(i = 0; i < NumTest; i += 1)
+
+		BiasTest[i] = -900 + 100*i
+
+
+
+		CircuitCurrent[i] = Mean(CurrentWave)
+
+	EndFor
+
+End
+
+Window AuAuConductanceLevel() : Graph
+	PauseUpdate; Silent 1		// building window...
+	Display /W=(8.25,245.75,327.75,417.5) PullOutConductance as "PullOutLowG"
+	ModifyGraph grid(left)=1
+	Label left "Conductance (G\\B0\\M)"
+	Label bottom "Displacement (nm)"
+	SetAxis left 1e-05,5
+EndMacro
+
+Window BreakJunctionMeasurement() : Panel
+	PauseUpdate; Silent 1		// building window...
+	NewPanel /W=(1107,64,1494,885) as "Molecular Break Junction Measurement"
+	ModifyPanel cbRGB=(48896,52992,65280), frameStyle=1
+	SetDrawLayer UserBack
+	SetDrawEnv save
+	DrawRect 21,153,21,153
+	Slider SliderPos_Z,pos={42,610},size={301,53},disable=2,proc=SetPiezoBiasFromSlider
+	Slider SliderPos_Z,font="Arial",fSize=12
+	Slider SliderPos_Z,limits={0,10,0.01},value=0,live= 0,vert= 0,ticks= 20,thumbColor= (26112,0,0)
+	SetVariable MoveZStepSize,pos={156,581},size={75,18},title="Z (nm)",font="Arial"
+	SetVariable MoveZStepSize,limits={0,100,1},value= G_PiezoDeltaZ_nm
+	SetVariable setvar43,pos={191,322},size={143,20},proc=SetGain,title="Gain ( log(V/A) )"
+	SetVariable setvar43,font="Arial",fSize=14
+	SetVariable setvar43,limits={3,9,1},value= G_CurrentVoltGain
+	SetVariable TipBias_Inputs,pos={49,220},size={153,20},disable=1,proc=SetTipBiasVoltage,title="Tip Bias (mV)"
+	SetVariable TipBias_Inputs,font="Arial",fSize=14,format="%3.1f"
+	SetVariable TipBias_Inputs,limits={-5000,5000,0},value= G_TipBias
+	Button MoveZIn,pos={55,580},size={76,23},proc=PiezoStepCloser,title="Step closer"
+	Button MoveZIn,font="Arial"
+	Button MoveZout,pos={259,581},size={76,22},proc=PiezoStepApart,title="Step apart"
+	Button MoveZout,font="Arial"
+	SetVariable Excursion_Inputs,pos={51,69},size={146,20},disable=1,title="Excursion (nm)"
+	SetVariable Excursion_Inputs,font="Arial",fSize=14
+	SetVariable Excursion_Inputs,limits={0.1,500,0},value= G_PseudoTotalLength_nm
+	SetVariable EngageG_Inputs,pos={31,98},size={190,20},disable=1,title="Contact Threshold (G0)"
+	SetVariable EngageG_Inputs,font="Arial",fSize=14
+	SetVariable EngageG_Inputs,limits={0,10000,0},value= G_ConductanceThreshold
+	SetVariable EngageStep_Inputs,pos={29,128},size={194,20},disable=1,title="Contact step size (nm)"
+	SetVariable EngageStep_Inputs,font="Arial",fSize=14
+	SetVariable EngageStep_Inputs,limits={0,50,0},value= G_MakeContactApproachStepSize
+	SetVariable Saved_setVar,pos={31,720},size={139,22},title="Saved",font="Arial"
+	SetVariable Saved_setVar,fSize=16,fStyle=1
+	SetVariable Saved_setVar,limits={0,inf,0},value= G_PullOutNumber
+	SetVariable PullRate_Inputs,pos={47,41},size={146,20},disable=1,title="Pull Rate (nm/s)"
+	SetVariable PullRate_Inputs,font="Arial",fSize=14
+	SetVariable PullRate_Inputs,limits={0,1000,0},value= G_PullOutRate
+	SetVariable SuppressSetVar,pos={181,356},size={153,20},proc=SetCurrentSuppress,title="Suppress (pA)"
+	SetVariable SuppressSetVar,font="Arial",fSize=14,format="%3.1f"
+	SetVariable SuppressSetVar,limits={-1000,1000,10},value= G_CurrentSuppress
+	CheckBox SuppressCheckBox,pos={59,325},size={85,16},proc=CurrentSuppressCheckProc,title="Suppress I"
+	CheckBox SuppressCheckBox,font="Arial",fSize=14,value= 0
+	SetVariable setvar17,pos={30,789},size={139,20},title="Attempts",font="Arial"
+	SetVariable setvar17,fSize=14,fStyle=1,limits={0,inf,0},value= G_PullOutAttempt
+	CheckBox SaveBias_Inputs,pos={231,33},size={81,16},disable=1,title="Save Bias"
+	CheckBox SaveBias_Inputs,font="Arial",fSize=14,variable= G_BiasSaveCheck
+	CheckBox SaveCurrent_Inputs,pos={231,52},size={102,16},disable=1,title="Save Current"
+	CheckBox SaveCurrent_Inputs,font="Arial",fSize=14,variable= G_CurrentSaveCheck
+	CheckBox SaveHist_Inputs,pos={231,109},size={77,16},disable=1,title="Save Hist"
+	CheckBox SaveHist_Inputs,font="Arial",fSize=14,variable= G_HistSaveCheck
+	SetVariable AcqRate_DAQ,pos={39,122},size={193,20},title="Acquisition Rate"
+	SetVariable AcqRate_DAQ,font="Arial",fSize=14
+	SetVariable AcqRate_DAQ,limits={100,200000,0},value= G_AcquisitionRate
+	Button Start_DAQ,pos={250,43},size={94,46},proc=StartHighResWritingTask,title="Start\rWriting"
+	Button Start_DAQ,help={"Starts the writing task (\"G_OD1\") in the high-res card"}
+	Button Start_DAQ,font="Arial",fSize=14,fStyle=1,fColor=(0,0,39168)
+	Button Stop_DAQ,pos={251,101},size={94,46},proc=StopWritingTasks,title="Kill\rTasks"
+	Button Stop_DAQ,font="Arial",fSize=14,fStyle=1,fColor=(52224,0,0)
+	SetVariable WriteBufferSize_DAQ,pos={68,156},size={164,20},title="Write Buffer Size"
+	SetVariable WriteBufferSize_DAQ,font="Arial",fSize=14
+	SetVariable WriteBufferSize_DAQ,limits={25,2000,0},value= G_WriteBufferSize
+	TabControl TAB,pos={20,6},size={347,241},proc=MainWindowTabProc
+	TabControl TAB,labelBack=(48896,65280,57344),font="Arial",fSize=14
+	TabControl TAB,tabLabel(0)="DAQ",tabLabel(1)="Inputs",tabLabel(2)="Options"
+	TabControl TAB,value= 0
+	Button Reset_DAQ,pos={251,158},size={94,46},proc=ResetDAQDevices,title="Reset DAQ\rDevices"
+	Button Reset_DAQ,labelBack=(65535,65535,65535),font="Arial",fSize=14,fStyle=1
+	Button Reset_DAQ,fColor=(52224,52224,52224)
+	ValDisplay CurrentReadOut,pos={10,682},size={115,20},title="I (muA)",font="Arial"
+	ValDisplay CurrentReadOut,fSize=16,format="%3.5f",frame=2,fStyle=1
+	ValDisplay CurrentReadOut,limits={0,0,0},barmisc={0,1000}
+	ValDisplay CurrentReadOut,value= #"root:G_CurrentSamplingReadoutVal"
+	CheckBox OnCheck,pos={47,259},size={288,19},proc=BkgdSamplingCheckProc,title="Background Sampling (Beep is ON)"
+	CheckBox OnCheck,font="Arial",fSize=16,fStyle=1,value= 0
+	SetVariable StopNo_setVar,pos={30,755},size={139,22},title="Stop #",font="Arial"
+	SetVariable StopNo_setVar,fSize=16,fStyle=1,limits={0,inf,0},value= G_StopNumber
+	SetVariable ZerCutoff_Inputs,pos={34,191},size={178,20},disable=1,title="Zero Cutoff (G0)"
+	SetVariable ZerCutoff_Inputs,font="Arial",fSize=14
+	SetVariable ZerCutoff_Inputs,limits={0,0.5,0},value= G_EndOfTraceNoiseThreshold
+	ValDisplay PiezoVoltReadout,pos={254,682},size={118,20},title="Piezo (V)"
+	ValDisplay PiezoVoltReadout,font="Arial",fSize=16,format="%3.2f",frame=2
+	ValDisplay PiezoVoltReadout,fStyle=1,limits={0,0,0},barmisc={0,1000}
+	ValDisplay PiezoVoltReadout,value= #"root:G_PiezoBiasSamplingReadoutVal"
+	SetVariable SeriesR_Inputs,pos={36,160},size={165,20},disable=1,title="Series R (Ohm)"
+	SetVariable SeriesR_Inputs,font="Arial",fSize=14
+	SetVariable SeriesR_Inputs,limits={-inf,inf,0},value= G_SeriesResistance
+	SetVariable SmashFreq_Inputs,pos={222,169},size={126,20},disable=1,title="Smash Freq."
+	SetVariable SmashFreq_Inputs,font="Arial",fSize=14
+	SetVariable SmashFreq_Inputs,limits={0,inf,0},value= G_SmashFrequency
+	GroupBox box10105,pos={27,288},size={329,152},title="Femto Controls"
+	GroupBox box10105,font="Arial",fSize=12,frame=0
+	ValDisplay ZPiezoScale_DAQ,pos={53,52},size={170,17},title="Z piezo scale (nm/V)"
+	ValDisplay ZPiezoScale_DAQ,font="Arial",fSize=14,limits={0,0,0},barmisc={0,1000}
+	ValDisplay ZPiezoScale_DAQ,value= #"K_ZPiezoScale"
+	ValDisplay ZSenseScale_DAQ,pos={49,83},size={175,17},title="Z Sense scale (nm/V)"
+	ValDisplay ZSenseScale_DAQ,font="Arial",fSize=14,limits={0,0,0},barmisc={0,1000}
+	ValDisplay ZSenseScale_DAQ,value= #"K_SenseScale"
+	CheckBox check08,pos={201,572},size={50,20},disable=1,value= 0
+	SetVariable setvar15,pos={261,572},size={50,18},disable=1
+	Button FindSuppressButton,pos={50,352},size={107,28},proc=FindSuppress,title="Find Suppress"
+	Button FindSuppressButton,font="Arial",fSize=14,fColor=(0,65280,0)
+	SetVariable setvar5,pos={285,543},size={50,20},disable=1
+	SetVariable setvar7,pos={4,568},size={50,20},disable=1
+	Button StartMeasurementButton,pos={185,754},size={129,55},proc=StartMeasurement,title="Start\rMeasurement"
+	Button StartMeasurementButton,labelBack=(65280,54528,32768),font="Arial"
+	Button StartMeasurementButton,fSize=16,fStyle=1,fColor=(0,52224,26368)
+	Button StepOpen,pos={159,507},size={85,24},proc=StepActuatorApart,title="Step apart"
+	Button StepOpen,font="Arial",fSize=14
+	Button StepTogether,pos={64,507},size={89,24},proc=StepActuatorCloser,title="Step closer"
+	Button StepTogether,font="Arial",fSize=14
+	SetVariable StepSizeSetVar,pos={40,479},size={122,20},title="Step Size"
+	SetVariable StepSizeSetVar,font="Arial",fSize=14
+	SetVariable StepSizeSetVar,limits={1,inf,1},value= G_ActuatorStepSize
+	Button StartApproachButton,pos={256,479},size={86,50},proc=ApproachButton,title="Start\rApproach"
+	Button StartApproachButton,font="Arial",fSize=14,fStyle=1,fColor=(0,43520,65280)
+	SetVariable SmashIn_Inputs,pos={243,196},size={88,20},disable=1,title="Smash In"
+	SetVariable SmashIn_Inputs,font="Arial",fSize=14
+	SetVariable SmashIn_Inputs,limits={-inf,inf,0},value= G_SmashInSteps
+	SetVariable SmashOut_Inputs,pos={232,219},size={106,20},disable=1,title="Smash Out"
+	SetVariable SmashOut_Inputs,font="Arial",fSize=14
+	SetVariable SmashOut_Inputs,limits={-inf,inf,0},value= G_SmashOutSteps
+	GroupBox PiezoGroupbox,pos={28,555},size={330,112},title="Piezo Controls"
+	GroupBox PiezoGroupbox,font="Arial",frame=0
+	GroupBox ActuatorGroupBox,pos={27,452},size={331,90},title="Actuator Controls"
+	GroupBox ActuatorGroupBox,font="Arial",frame=0
+	TabControl RampSubTabs_Ramps,pos={20,27},size={348,220},disable=1,proc=SubWindowTabProc
+	TabControl RampSubTabs_Ramps,labelBack=(65280,65280,32768),font="Arial"
+	TabControl RampSubTabs_Ramps,tabLabel(0)="Push-Pull",tabLabel(1)="IV"
+	TabControl RampSubTabs_Ramps,tabLabel(2)="AC",tabLabel(3)="High bias hold"
+	TabControl RampSubTabs_Ramps,value= 0
+	CheckBox PushPullCheck_PushPullRamps,pos={49,77},size={78,16},disable=1,proc=RampOptionsCheckProc,title="Push-Pull"
+	CheckBox PushPullCheck_PushPullRamps,font="Arial",fSize=14
+	CheckBox PushPullCheck_PushPullRamps,variable= G_PushPullCheck
+	SetVariable NoPPCyclesSetvar_PushPullRamps,pos={152,75},size={175,20},disable=1,title="Number of cycles"
+	SetVariable NoPPCyclesSetvar_PushPullRamps,font="Arial",fSize=14
+	SetVariable NoPPCyclesSetvar_PushPullRamps,value= G_NumPushPullCycles
+	SetVariable PPInitialPull_PushPullRamps,pos={51,115},size={132,20},disable=1,title="Initial Pull (nm)"
+	SetVariable PPInitialPull_PushPullRamps,font="Arial",fSize=14
+	SetVariable PPInitialPull_PushPullRamps,limits={-inf,inf,0},value= G_InitialPullLength
+	SetVariable PPFinalPull_PushPullRamps,pos={195,115},size={131,20},disable=1,title="Final Pull (nm)"
+	SetVariable PPFinalPull_PushPullRamps,font="Arial",fSize=14
+	SetVariable PPFinalPull_PushPullRamps,limits={-inf,inf,0},value= G_FinalPullLength
+	SetVariable PushPullLength_PushPullRamps,pos={98,156},size={174,20},disable=1,title="Push-Pull length (nm)"
+	SetVariable PushPullLength_PushPullRamps,font="Arial",fSize=14
+	SetVariable PushPullLength_PushPullRamps,limits={-inf,inf,0},value= G_PushPullLength
+	SetVariable HoldLength_PushPullRamps,pos={111,196},size={143,20},disable=1,title="Hold length (nm)"
+	SetVariable HoldLength_PushPullRamps,font="Arial",fSize=14
+	SetVariable HoldLength_PushPullRamps,limits={-inf,inf,0},value= G_HoldLength
+	CheckBox IVCheck_IVRamps,pos={55,79},size={30,16},disable=1,proc=RampOptionsCheckProc,title="IV"
+	CheckBox IVCheck_IVRamps,font="Arial",fSize=14,variable= G_IVCheck
+	SetVariable MaxBias_IVRamps,pos={207,76},size={119,20},disable=1,title="MaxBias (V)"
+	SetVariable MaxBias_IVRamps,font="Arial",fSize=14,format="%1.2f"
+	SetVariable MaxBias_IVRamps,limits={-inf,inf,0},value= G_IVMaxBias
+	PopupMenu IVSignPopup_IVRamps,pos={102,76},size={84,21},disable=1,proc=IVSignPopup,title="Sign:"
+	PopupMenu IVSignPopup_IVRamps,font="Arial",fSize=14
+	PopupMenu IVSignPopup_IVRamps,mode=1,popvalue="+ / -",value= #"\"+ / -;- / +\""
+	SetVariable IVInitPull_IVRamps,pos={49,120},size={124,20},disable=1,title="Initial Pull (nm)"
+	SetVariable IVInitPull_IVRamps,font="Arial",fSize=14,format="%3.1f"
+	SetVariable IVInitPull_IVRamps,limits={-inf,inf,0},value= G_IVInitPull
+	SetVariable IVIFinPull_IVRamps,pos={196,120},size={124,20},disable=1,title="Final Pull (nm)"
+	SetVariable IVIFinPull_IVRamps,font="Arial",fSize=14,format="%3.1f"
+	SetVariable IVIFinPull_IVRamps,limits={-inf,inf,0},value= G_IVFinPull
+	SetVariable IVCapLength_IVRamps,pos={119,164},size={138,20},disable=1,title="Cap length (nm)"
+	SetVariable IVCapLength_IVRamps,font="Arial",fSize=14,format="%3.1f"
+	SetVariable IVCapLength_IVRamps,limits={-inf,inf,0},value= G_IVCapLength
+	SetVariable IVRampLength_IVRamps,pos={112,204},size={149,20},disable=1,title="Ramp length (nm)"
+	SetVariable IVRampLength_IVRamps,font="Arial",fSize=14,format="%3.1f"
+	SetVariable IVRampLength_IVRamps,limits={-inf,inf,0},value= G_IVRampLength
+	CheckBox ACHoldCheck_ACHoldRamps,pos={160,66},size={69,16},disable=1,proc=RampOptionsCheckProc,title="AC Hold"
+	CheckBox ACHoldCheck_ACHoldRamps,font="Arial",fSize=14,variable= G_ACHoldCheck
+	SetVariable ACAmp_ACHoldRamps,pos={74,100},size={92,20},disable=1,title="Amp (V)"
+	SetVariable ACAmp_ACHoldRamps,font="Arial",fSize=14,format="%1.2f"
+	SetVariable ACAmp_ACHoldRamps,limits={-inf,inf,0},value= G_ACAmp
+	SetVariable ACFreq_ACHoldRamps,pos={193,101},size={113,20},disable=1,title="Freq (kHz)"
+	SetVariable ACFreq_ACHoldRamps,font="Arial",fSize=14,format="%3.1f"
+	SetVariable ACFreq_ACHoldRamps,limits={-inf,inf,0},value= G_ACFreq
+	SetVariable ACInitPull_ACHoldRamps,pos={131,138},size={125,20},disable=1,title="Initial Pull (nm)"
+	SetVariable ACInitPull_ACHoldRamps,font="Arial",fSize=14,format="%3.1f"
+	SetVariable ACInitPull_ACHoldRamps,limits={-inf,inf,0},value= G_ACInitPullLength
+	SetVariable ACHoldLength_ACHoldRamps,pos={125,173},size={137,20},disable=1,title="Hold length (nm)"
+	SetVariable ACHoldLength_ACHoldRamps,font="Arial",fSize=14,format="%3.1f"
+	SetVariable ACHoldLength_ACHoldRamps,limits={-inf,inf,0},value= G_ACHoldLength
+	SetVariable ACFinalPulll_ACHoldRamps,pos={131,209},size={126,20},disable=1,title="Final Pull (nm)"
+	SetVariable ACFinalPulll_ACHoldRamps,font="Arial",fSize=14,format="%3.1f"
+	SetVariable ACFinalPulll_ACHoldRamps,limits={-inf,inf,0},value= G_ACFinPullLength
+	SetVariable TipBias,pos={181,719},size={168,22},proc=SetTipBiasVoltage,title="Tip Bias (mV)"
+	SetVariable TipBias,font="Arial",fSize=16,format="%3.1f",fStyle=1
+	SetVariable TipBias,limits={-5000,5000,0},value= G_TipBias
+	Button SingleAttemptButton,pos={324,764},size={25,37},proc=MakeAttempt,title="+1"
+	Button SingleAttemptButton,font="Arial",fSize=14,fStyle=1,fColor=(0,43520,65280)
+	SetVariable ReadWaveSize_DAQ,pos={40,189},size={193,20},title="Fast Read Wave Size"
+	SetVariable ReadWaveSize_DAQ,font="Arial",fSize=14
+	SetVariable ReadWaveSize_DAQ,limits={25,2000,0},value= G_FastReadWaveSize
+	ValDisplay ActuatorCounter_Valdisp,pos={171,480},size={71,17},font="Arial"
+	ValDisplay ActuatorCounter_Valdisp,fSize=14,frame=0
+	ValDisplay ActuatorCounter_Valdisp,limits={0,0,0},barmisc={0,1000}
+	ValDisplay ActuatorCounter_Valdisp,value= #"G_ActuatorCounter"
+	SetVariable CounterElectrodeSetVar_EChem,pos={47,79},size={258,22},disable=1,proc=CounterElectrodeSetVar,title="Counter Electrode Bias (mV)"
+	SetVariable CounterElectrodeSetVar_EChem,font="Arial",fSize=16
+	SetVariable CounterElectrodeSetVar_EChem,limits={-5000,5000,0},value= G_CounterElectrodeBias
+	CheckBox CounterElectrodeCheck_EChem,pos={77,48},size={185,19},disable=1,proc=CounterElectrodeCheckProc,title="Counter Electrode ON"
+	CheckBox CounterElectrodeCheck_EChem,font="Arial",fSize=16,fStyle=1,value= 0
+	CheckBox SaveSense_Inputs,pos={231,90},size={94,16},disable=1,title="Save Sense"
+	CheckBox SaveSense_Inputs,font="Arial",fSize=14,variable= G_SenseSaveCheck
+	CheckBox HBHoldCheck_HBHoldRamps,pos={227,59},size={109,16},disable=1,proc=RampOptionsCheckProc,title="High Bias Hold"
+	CheckBox HBHoldCheck_HBHoldRamps,font="Arial",fSize=14,variable= G_HBHoldCheck
+	SetVariable HBBias_HBHoldRamps,pos={40,75},size={153,20},disable=1,title="Hold bias (V)"
+	SetVariable HBBias_HBHoldRamps,font="Arial",fSize=14,format="%1.5f"
+	SetVariable HBBias_HBHoldRamps,limits={-inf,inf,0},value= G_HBBias
+	SetVariable HBInitPull__HBHoldRamps,pos={40,102},size={149,20},disable=1,title="Initial Pull (nm)"
+	SetVariable HBInitPull__HBHoldRamps,font="Arial",fSize=14,format="%3.2f"
+	SetVariable HBInitPull__HBHoldRamps,limits={-inf,inf,0},value= G_HBInitPullLength
+	SetVariable HBHoldLength_HBHoldRamps,pos={43,133},size={153,20},disable=1,title="Hold length (nm)"
+	SetVariable HBHoldLength_HBHoldRamps,font="Arial",fSize=14,format="%3.2f"
+	SetVariable HBHoldLength_HBHoldRamps,limits={-inf,inf,0},value= G_HBHoldLength
+	SetVariable HBFinalPulll_HBHoldRamps,pos={200,101},size={143,20},disable=1,title="Final Pull (nm)"
+	SetVariable HBFinalPulll_HBHoldRamps,font="Arial",fSize=14,format="%3.2f"
+	SetVariable HBFinalPulll_HBHoldRamps,limits={-inf,inf,0},value= G_HBFinPullLength
+	SetVariable HBCapIN__HBHoldRamps,pos={42,158},size={160,36},disable=1,title="Cap \rLength IN (nm)"
+	SetVariable HBCapIN__HBHoldRamps,font="Arial",fSize=14,format="%3.5f"
+	SetVariable HBCapIN__HBHoldRamps,limits={-inf,inf,0},value= G_HBCapLengthIN
+	CheckBox VoltageRead_Inputs,pos={231,129},size={100,16},disable=1,title="VoltageRead"
+	CheckBox VoltageRead_Inputs,font="Arial",fSize=14,variable= G_VoltageRead
+	CheckBox SavePiezoWave_Inputs,pos={231,71},size={128,16},disable=1,title="Save Piezo Wave"
+	CheckBox SavePiezoWave_Inputs,font="Arial",fSize=14
+	CheckBox SavePiezoWave_Inputs,variable= G_PiezoWaveSaveCheck
+	ValDisplay JunctionVoltageReadout,pos={133,682},size={112,20},title="V (mV)"
+	ValDisplay JunctionVoltageReadout,font="Arial",fSize=16,format="%3.2f",frame=2
+	ValDisplay JunctionVoltageReadout,fStyle=1,limits={0,0,0},barmisc={0,1000}
+	ValDisplay JunctionVoltageReadout,value= #"root:G_JunctionVoltage"
+	SetVariable OutputRangeHighRes_DAQ,pos={40,216},size={227,20},title="HighRes Output Range (V)"
+	SetVariable OutputRangeHighRes_DAQ,font="Arial",fSize=14
+	SetVariable OutputRangeHighRes_DAQ,limits={0,10,0},value= G_HighResOutputRange
+	SetVariable HBCapFIN__HBHoldRamps,pos={42,200},size={166,36},disable=1,title="Cap \rLength FIN (nm)"
+	SetVariable HBCapFIN__HBHoldRamps,font="Arial",fSize=14,format="%3.5f"
+	SetVariable HBCapFIN__HBHoldRamps,limits={-inf,inf,0},value= G_HBCapLengthFIN
+	CheckBox check_CustomRamps,pos={290,220},size={53,14},disable=1,title="Custom"
+	CheckBox check_CustomRamps,font="Arial",fSize=14,variable= G_CustomInputCheck
+EndMacro
+
+Window HighRes() : Graph
+	PauseUpdate; Silent 1		// building window...
+	Display /W=(342,451.25,653.25,631.25) VoltageIn
+	AppendToGraph/R CurrentIn
+	ModifyGraph rgb(VoltageIn)=(0,0,52224),rgb(CurrentIn)=(0,39168,19712)
+	Label left "Voltage"
+	Label bottom "Point"
+	Label right "Current"
+EndMacro
+
+Window LogHistOfBlock() : Graph
+	PauseUpdate; Silent 1		// building window...
+	Display /W=(344.25,191.75,614.25,420.5) LogHistWave
+	ModifyGraph margin(left)=60,margin(bottom)=50,margin(right)=30,gFont="Arial",gfSize=14
+	ModifyGraph mode=7
+	ModifyGraph rgb=(0,0,65280)
+	ModifyGraph hbFill=5
+	ModifyGraph tick=2
+	ModifyGraph mirror=2
+	ModifyGraph fSize=14
+	ModifyGraph standoff=0
+	ModifyGraph axThick=1.5
+	ModifyGraph lblPosMode=3
+	ModifyGraph lblPos(left)=55,lblPos(bottom)=45
+	ModifyGraph axisOnTop=1
+	Label left "Counts/Trace"
+	Label bottom "Conductance [Log]"
+	SetAxis/A=2 left
+	SetAxis bottom -8,1
+EndMacro
+
+Window PullOutGvsE() : Graph
+	PauseUpdate; Silent 1		// building window...
+	Display /W=(6,44,327,216.5)/R PullOutVoltage
+	AppendToGraph PullOutConductance
+	ModifyGraph mode(PullOutVoltage)=2
+	ModifyGraph rgb(PullOutVoltage)=(47872,47872,47872)
+	ModifyGraph grid(left)=1
+	ModifyGraph notation(right)=1
+	ModifyGraph prescaleExp(right)=3
+	Label right "Measured Bias (mV)"
+	Label bottom "Displacement (nm)"
+	Label left "Conductance (G\\B0\\M)"
+	SetAxis left 0,*
+EndMacro
+
+Window PullOutLow() : Graph
+	PauseUpdate; Silent 1		// building window...
+	Display /W=(9,447.5,328.5,619.25) PullOutConductance as "PullOutLowG"
+	ModifyGraph grid(left)=1
+	ModifyGraph log(left)=1
+	Label left "Conductance (G\\B0\\M)"
+	Label bottom "Displacement (nm)"
+	SetAxis left 1e-06,5.58676
+EndMacro
+
+Window SenseInDisplay() : Graph
+	PauseUpdate; Silent 1		// building window...
+	Display /W=(344.25,44.75,615,181.25) SenseIn
+EndMacro
+
+
+
+
+
+
+
+
+
+
+
+
